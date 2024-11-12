@@ -13,7 +13,7 @@ if not os.path.exists(save_path):
 
 dataset = Hybrid_points(data_root, 'train', 1024)
 train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size,
-                                               num_workers=8,
+                                               num_workers=2,
                                                drop_last=False,
                                                worker_init_fn=worker_init_fn,
                                                pin_memory=True)

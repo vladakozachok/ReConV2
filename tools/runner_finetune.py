@@ -56,6 +56,7 @@ def run_net(args, config):
     start_epoch = 0
     best_metrics = Acc_Metric(0.)
     metrics = Acc_Metric(0.)
+    print_log(start_epoch)
 
     # resume ckpts
     if args.resume:

@@ -112,10 +112,10 @@ def main(args):
 
     TRAIN_DATASET = PartNormalDataset(root=root, npoints=args.npoint, split='trainval', normal_channel=args.normal)
     trainDataLoader = torch.utils.data.DataLoader(TRAIN_DATASET, batch_size=args.batch_size, shuffle=True,
-                                                  num_workers=8, drop_last=True)
+                                                  num_workers=2, drop_last=True)
     TEST_DATASET = PartNormalDataset(root=root, npoints=args.npoint, split='test', normal_channel=args.normal)
     testDataLoader = torch.utils.data.DataLoader(TEST_DATASET, batch_size=args.batch_size * 2, shuffle=False,
-                                                 num_workers=8)
+                                                 num_workers=2)
     log_string("The number of training data is: %d" % len(TRAIN_DATASET))
     log_string("The number of test data is: %d" % len(TEST_DATASET))
 

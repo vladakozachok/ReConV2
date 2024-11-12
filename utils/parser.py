@@ -11,7 +11,7 @@ def get_args():
         help='yaml config file')
     parser.add_argument('--distributed', action='store_true', default=False)
     parser.add_argument('--local-rank', type=int, default=0)
-    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--num_workers', type=int, default=2)
     # seed
     parser.add_argument('--seed', type=int, default=0, help='random seed')
     parser.add_argument(
