@@ -11,7 +11,11 @@ from datasets import data_transforms
 from pointnet2_ops import pointnet2_utils
 from torchvision import transforms
 
+import wandb
 
+wandb.init(
+    project="ReCon2",
+)
 class Acc_Metric:
     def __init__(self, acc=0.):
         if type(acc).__name__ == 'dict':
@@ -155,6 +159,18 @@ def run_net(args, config):
                 losses.update([loss.item(), acc])
             else:
                 losses.update([loss.item(), acc])
+
+            losses_avg = losses.avg()
+            
+            wandb.log({
+                "epoch": epoch,
+                "batch_idx": idx,
+                "train_loss": losses_avg[0],  # Average loss so far
+                "train_accuracy": losses_avg[1],  # Average accuracy so far
+                "batch_time": batch_time.avg(),  # Average batch processing time
+                "data_time": data_time.avg(),    # Average data loading time
+                "learning_rate": optimizer.param_groups[0]["lr"],  # Current learning rate
+            })
 
             if args.distributed:
                 torch.cuda.synchronize()
