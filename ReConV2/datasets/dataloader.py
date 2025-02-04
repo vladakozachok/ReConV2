@@ -8,6 +8,7 @@ from torch.utils.data import Dataset
 from .build import DATASETS
 from ReConV2.utils.logger import *
 import torch
+from google.cloud import storage
 
 warnings.filterwarnings('ignore')
 
@@ -24,31 +25,36 @@ class PointDetect3D(Dataset):
         split = config.subset
         self.subset = config.subset
         self.with_color = config.with_color
+        self.client = storage.Client()
+        self.bucket = self.client.bucket(self.root)
 
         
-        self.catfile = os.path.join(self.root, 'model_train.txt')
-        self.cat = [line.rstrip() for line in open(self.catfile)]
+        # Acquire all the classes
+        self.catfile = 'collection_names.txt'  # classes
+        self.cat = self.read_text_file(self.catfile)
         self.classes = dict(zip(self.cat, range(len(self.cat))))
 
-        contract_ids = {}
+        collection_ids = {}
 
-        contract_ids['train'] = [line.rstrip() for line in open(os.path.join(self.root, 'model_train.txt'))]
-        contract_ids['test'] = [line.rstrip() for line in open(os.path.join(self.root, 'model_test.txt'))]
+        collection_ids['train'] = self.read_text_file('model_train.txt')
+        collection_ids['test'] = self.read_text_file('model_test.txt')
 
         assert (split == 'train' or split == 'test')
-        contract_names = ['_'.join(x.split('_')[0:-1]) for x in contract_ids[split]]
-        self.datapath = [(contract_names[i], os.path.join(self.root, contract_names[i], contract_names[split][i]) + '.txt') for i
-                         in range(len(contract_names[split]))]
-        print_log('The size of %s data is %d' % (split, len(self.datapath)), logger='ModelNet')
+        
+        collection_names = ['_'.join(x.split('-')[0:-1]) for x in collection_ids[split]]
+        self.datapath = [(collection_names[i], os.path.join("unique-asset-clouds", collection_ids[split][i]) + '.dat') for i
+                         in range(len(collection_ids[split]))]
+
+        print_log('The size of %s data is %d' % (split, len(self.datapath)), logger='PointDetect3D')
 
         if self.uniform:
-            self.save_path = 'cached_data%d_%s_%dpts_fps.dat' % (self.num_category, split, self.npoints)
+            self.save_path = 'pointdetect3d%d_%s_%dpts_fps.dat' % (self.num_category, split, self.npoints)
         else:
-            self.save_path = 'cached_data%d_%s_%dpts.dat' % (self.num_category, split, self.npoints)
+            self.save_path = 'pointdetect3d%d_%s_%dpts.dat' % (self.num_category, split, self.npoints)
 
         if self.process_data:
             if not os.path.exists(self.save_path):
-                print_log('Processing data %s (only running in the first time)...' % self.save_path, logger='ModelNet')
+                print_log('Processing data %s (only running in the first time)...' % self.save_path, logger='PointDetect')
                 self.list_of_points = [None] * len(self.datapath)
                 self.list_of_labels = [None] * len(self.datapath)
 
@@ -92,11 +98,18 @@ class PointDetect3D(Dataset):
 
       return 'PointDetect3D', 'sample', (point_set, label[0])
 
-    def __getitem__(self, index):
-        points, label = self._get_item(index)
-        pt_idxs = np.arange(0, points.shape[0])  # 2048
-        if self.subset == 'train':
-            np.random.shuffle(pt_idxs)
-        current_points = points[pt_idxs].copy()
-        current_points = torch.from_numpy(current_points).float()
-        return 'ModelNet', 'sample', (current_points, label)
+    def read_text_file(self, file_path):
+        blob = self.bucket.blob(file_path)
+        return blob.download_as_text().splitlines()
+        
+    def download_and_extract_dat_file(self, blob_name):
+        print(blob_name)
+        blob = self.bucket.blob(blob_name)
+        _, extension = os.path.splitext(blob_name)
+        
+        with tempfile.NamedTemporaryFile(suffix=extension) as temp_file:
+            blob.download_to_filename(temp_file.name)
+            with open(temp_file.name, 'rb') as f:
+                point_cloud = pickle.load(f)
+
+            return point_cloud
