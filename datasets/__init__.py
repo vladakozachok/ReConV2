@@ -3,3 +3,4 @@ import datasets.ModelNetDataset
 import datasets.ModelNetDatasetFewShot
 import datasets.ScanObjectNNDataset
 import datasets.HybridDataset
+import datasets.YakoaDataset

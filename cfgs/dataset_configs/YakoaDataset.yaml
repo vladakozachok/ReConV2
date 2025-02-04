@@ -1,0 +1,6 @@
+NAME: YakoaDataset
+DATA_PATH: yakoa-nft-catalog
+N_POINTS: 8192
+NUM_CATEGORY: 3 # For now 
+NUM_WORKERS: 8
+USE_NORMALS: FALSE

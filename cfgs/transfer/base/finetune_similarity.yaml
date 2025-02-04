@@ -12,15 +12,15 @@ scheduler:
 
 dataset:
   train:
-    _base_: cfgs/dataset_configs/ModelNet40.yaml
+    _base_: cfgs/dataset_configs/YakoaDataset.yaml
     others:
       subset: 'train'
   val:
-    _base_: cfgs/dataset_configs/ModelNet40.yaml
+    _base_: cfgs/dataset_configs/YakoaDataset.yaml
     others:
       subset: 'test'
   test:
-    _base_: cfgs/dataset_configs/ModelNet40.yaml
+    _base_: cfgs/dataset_configs/YakoaDataset.yaml
     others:
       subset: 'test'
       
