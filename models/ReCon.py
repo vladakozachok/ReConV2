@@ -534,7 +534,7 @@ class PointTransformer(nn.Module):
         embeddings = F.normalize(embeddings, dim=-1)
 
         # Compute similarity matrix
-        sim_matrix = F.cosine_similarity #/ temperature
+        sim_matrix = torch.matmul(embeddings, embeddings.T) #/ temperature
 
         # Create mask for positive pairs
         labels = labels.contiguous().view(-1, 1)
@@ -542,7 +542,7 @@ class PointTransformer(nn.Module):
         mask.fill_diagonal_(0)  # Remove self-similarities
 
         # Compute numerator (positive pairs) and denominator (all pairs)
-        scaled_sim = sim_matrix/temperature
+        scaled_sim = sim_matrix / temperature
         exp_sim = torch.exp(scaled_sim)
         exp_sim = torch.clamp(exp_sim, min=1e-8)  # Ensure no value is too small
 
