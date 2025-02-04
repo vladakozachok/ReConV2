@@ -5,6 +5,7 @@ from utils import misc, dist_utils
 import time
 from utils.logger import *
 from utils.AverageMeter import AverageMeter
+import torch.nn.functional as F
 
 import numpy as np
 from datasets import data_transforms
@@ -113,6 +114,10 @@ def run_net(args, config):
         base_model.train()  # set model to training mode
 
         npoints = config.npoints
+        
+        torch.cuda.empty_cache()
+
+                               
         for idx, (taxonomy_ids, model_ids, data) in enumerate(train_dataloader):
             num_iter += 1
 
@@ -142,6 +147,7 @@ def run_net(args, config):
             points = train_transforms(points)
             ret, cd_loss = base_model(points)
             loss, acc = base_model.module.get_loss_acc(ret, label)
+            
             _loss = loss + 3 * cd_loss
             _loss.backward()
 
@@ -165,8 +171,8 @@ def run_net(args, config):
             wandb.log({
                 "epoch": epoch,
                 "batch_idx": idx,
-                "train_loss": losses_avg[0],  # Average loss so far
-                "train_accuracy": losses_avg[1],  # Average accuracy so far
+                "train_loss_avg": losses_avg[0],  # Average loss so far
+                "train_accuracy_avg": losses_avg[1],  # Average accuracy so far
                 "batch_time": batch_time.avg(),  # Average batch processing time
                 "data_time": data_time.avg(),    # Average data loading time
                 "learning_rate": optimizer.param_groups[0]["lr"],  # Current learning rate
@@ -189,25 +195,27 @@ def run_net(args, config):
                   (epoch, epoch_end_time - epoch_start_time, ['%.4f' % l for l in losses.avg()],
                    optimizer.param_groups[0]['lr']), logger=logger)
 
-        if epoch % args.val_freq == 0 and epoch != 0:
+        # if epoch % args.val_freq == 0 and epoch != 0:
+        if epoch % 1 == 0:
             # Validate the current model
             metrics = validate(base_model, test_dataloader, epoch, args, config, best_metrics,
                                logger=logger)
-
             better = metrics.better_than(best_metrics)
             # Save ckeckpoints
-            if better:
-                best_metrics = metrics
-                builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-best', args,
-                                        logger=logger)
-                print_log(
-                    "--------------------------------------------------------------------------------------------",
-                    logger=logger)
-        builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-last', args, logger=logger)
+            # if better:
+            #     best_metrics = metrics
+            #     builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-best', args,
+            #                             logger=logger)
+            #     print_log(
+            #         "--------------------------------------------------------------------------------------------",
+            #         logger=logger)
+        # builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-last', args, logger=logger)
+        
 
+            
 
 def validate(base_model, test_dataloader, epoch, args, config, best_metrics, logger=None):
-    # print_log(f"[VALIDATION] Start validating epoch {epoch}", logger = logger)
+    print_log(f"[VALIDATION] Start validating epoch {epoch}", logger = logger)
     base_model.eval()  # set model to eval mode
 
     test_pred = []
@@ -244,15 +252,32 @@ def validate(base_model, test_dataloader, epoch, args, config, best_metrics, log
         true_negatives = ((1 - predicted_similar) * (1 - mask.float())).sum()
         
         # Calculate accuracy
+        true_positives = (predicted_similar * mask).sum()
+        false_negatives = ((1 - predicted_similar) * mask).sum()  # Missed positives
+        pos_acc = true_positives / (true_positives + false_negatives) * 100.0  # Avoid divide-by-zero
+
+        # True Negatives: correctly predicted negative pairs
+        true_negatives = ((1 - predicted_similar) * (~mask)).sum()
+        false_positives = (predicted_similar * (~mask)).sum()  
+        neg_acc = true_negatives / (true_negatives + false_positives) * 100.0
+
+        # Total Accuracy
         total_pairs = mask.numel()
         correct_predictions = true_positives + true_negatives
-        acc = correct_predictions / total_pairs * 100.
+        acc = (correct_predictions / total_pairs) * 100.0
 
         print_log('[Validation Similarity] EPOCH: %d  accuracy = %.4f' % (epoch, acc), logger=logger)
 
+        wandb.log({
+                "val_acc": acc,
+                "val_pos_acc": pos_acc,
+                "val_neg_acc": neg_acc
+            })
+
         if args.distributed:
             torch.cuda.synchronize()
-
+        
+        del sim_matrix
     return Acc_Metric(acc)
 
 
