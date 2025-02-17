@@ -2,6 +2,7 @@ import os
 import numpy as np
 import warnings
 import pickle
+import tempfile 
 
 from tqdm import tqdm
 from torch.utils.data import Dataset
@@ -30,19 +31,24 @@ class YakoaDataset(Dataset):
 
         
         # Acquire all the classes
-        self.catfile = 'collection_names.txt'  # classes
-        self.cat = self.read_text_file(self.catfile)
-        self.classes = dict(zip(self.cat, range(len(self.cat))))
-
+        # self.catfile = 'collection_names.txt'  # classes
+        # self.cat = self.read_text_file(self.catfile)
+        # self.classes = dict(zip(self.cat, range(len(self.cat))))
+        self.classes = {}
         collection_ids = {}
 
-        collection_ids['train'] = self.read_text_file('model_train.txt')
-        collection_ids['test'] = self.read_text_file('model_test.txt')
+        collection_ids['train'] = self.read_text_file('train.txt')
+        collection_ids['test'] = self.read_text_file('train.txt')
 
         assert (split == 'train' or split == 'test')
         
         collection_names = ['_'.join(x.split('-')[0:-1]) for x in collection_ids[split]]
-        self.datapath = [(collection_names[i], os.path.join("unique-asset-clouds", collection_ids[split][i]) + '.dat') for i
+        for collection_name in collection_names:
+            if collection_name in self.classes:
+                self.classes[collection_name] +=1
+            else:
+                self.classes[collection_name] =1
+        self.datapath = [(collection_names[i], os.path.join("3d-assets-augmentation-with-docker", collection_ids[split][i]) + '.dat') for i
                          in range(len(collection_ids[split]))]
 
         print_log('The size of %s data is %d' % (split, len(self.datapath)), logger='PointDetect3D')
@@ -74,8 +80,8 @@ class YakoaDataset(Dataset):
                     self.list_of_points[index] = points_tensor
                     self.list_of_labels[index] = cls
 
-                with open(self.save_path, 'wb') as f:
-                    pickle.dump([self.list_of_points, self.list_of_labels], f)
+                # with open(self.save_path, 'wb') as f:
+                #     pickle.dump([self.list_of_points, self.list_of_labels], f)
             else:
                 print_log('Load processed data from %s...' % self.save_path, logger='ModelNet')
                 with open(self.save_path, 'rb') as f:
