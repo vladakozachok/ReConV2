@@ -42,14 +42,18 @@ class YakoaDataset(Dataset):
 
         assert (split == 'train' or split == 'test')
         
-        collection_names = ['_'.join(x.split('-')[0:-1]) for x in collection_ids[split]]
-        for collection_name in collection_names:
-            if collection_name in self.classes:
-                self.classes[collection_name] +=1
-            else:
-                self.classes[collection_name] =1
-        self.datapath = [(collection_names[i], os.path.join("3d-assets-augmentation-with-docker", collection_ids[split][i]) + '.dat') for i
+        collection_names = [x.split('/')[1] for x in collection_ids[split]]
+
+        
+        print(f"printing collection_names {collection_names}")
+        for idx, collection_name in enumerate(sorted(set(collection_names))):
+            self.classes[collection_name] = idx
+                        
+                
+        self.datapath = [(collection_names[i], os.path.join("3d-assets-augmentation-with-docker", collection_ids[split][i]) + '.pt') for i
                          in range(len(collection_ids[split]))]
+        
+        self.datapath = self.datapath
 
         print_log('The size of %s data is %d' % (split, len(self.datapath)), logger='PointDetect3D')
 
@@ -66,12 +70,13 @@ class YakoaDataset(Dataset):
 
                 for index in tqdm(range(len(self.datapath)), total=len(self.datapath)):
                     fn = self.datapath[index]
+                    print(f"cls {self.classes[self.datapath[index][0]]}")
                     cls = self.classes[self.datapath[index][0]]
                     cls = np.array([cls]).astype(np.int32)
 
                     try:
-                        np_points = self.download_and_extract_dat_file(fn[1])
-                        points_tensor = torch.tensor(np_points, dtype=torch.float)
+                        points_tensor = self.download_and_extract_dat_file(fn[1])
+                        # points_tensor = torch.tensor(np_points, dtype=torch.float)
 
                     except Exception as e:
                         print(f"Failed to read data from {fn[1]}: {e}")
@@ -107,15 +112,35 @@ class YakoaDataset(Dataset):
     def read_text_file(self, file_path):
         blob = self.bucket.blob(file_path)
         return blob.download_as_text().splitlines()
+
         
     def download_and_extract_dat_file(self, blob_name):
         print(blob_name)
         blob = self.bucket.blob(blob_name)
         _, extension = os.path.splitext(blob_name)
-        
-        with tempfile.NamedTemporaryFile(suffix=extension) as temp_file:
-            blob.download_to_filename(temp_file.name)
-            with open(temp_file.name, 'rb') as f:
-                point_cloud = pickle.load(f)
 
-            return point_cloud
+        # Use a temporary file to download the file from GCP
+        with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as temp_file:
+            temp_file_path = temp_file.name  # Store the temporary file path
+            
+            # Download the file to the temporary location
+            blob.download_to_filename(temp_file_path)
+            
+        try:
+            # Load the tensor file
+            points_tensor = torch.load(temp_file_path)
+            if not isinstance(points_tensor, torch.Tensor):
+                raise ValueError("Loaded file is not a PyTorch tensor.")
+
+        except Exception as e:
+            print(f"Error reading the file {temp_file_path}: {e}")
+            points_tensor = torch.tensor([])  # Return an empty tensor in case of error
+
+        finally:
+            # Clean up the temporary file
+            os.remove(temp_file_path)
+
+        return points_tensor
+
+
+        
