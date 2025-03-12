@@ -6,6 +6,7 @@ import time
 from utils.logger import *
 from utils.AverageMeter import AverageMeter
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
 import numpy as np
 from datasets import data_transforms
@@ -117,7 +118,9 @@ def run_net(args, config):
         
         torch.cuda.empty_cache()
 
-                               
+        gradient_norms = []
+        save_interval = 100  # Save heatmap every 100 steps
+        step_counter = 0                  
         for idx, (taxonomy_ids, model_ids, data) in enumerate(train_dataloader):
             num_iter += 1
 
@@ -143,21 +146,45 @@ def run_net(args, config):
             fps_idx = pointnet2_utils.furthest_point_sample(points, point_all)  # (B, npoint)
             fps_idx = fps_idx[:, np.random.choice(point_all, npoints, False)]
             points = pointnet2_utils.gather_operation(points.transpose(1, 2).contiguous(), fps_idx).transpose(1,
-                                                                                                              2).contiguous()  # (B, N, 3)
-            points = train_transforms(points)
+                                                                                        2).contiguous()  # (B, N, 3)
+            
+            # Normalize the points to range [0, 1]
+            min_vals = points.min(dim=1, keepdim=True)[0]  # (B, 1, 3)
+            max_vals = points.max(dim=1, keepdim=True)[0]  # (B, 1, 3)
+
+            # Avoid division by zero (if max_vals equals min_vals)
+            range_vals = max_vals - min_vals
+            range_vals = torch.clamp(range_vals, min=1e-6)  # To prevent division by zero
+
+            # Normalize to [0, 1]
+            normalized_points = (points - min_vals) / range_vals
+            points = train_transforms(normalized_points)
+            
+            print_log("Checking input tensor for NaNs...", logger=logger)
+            print_log(f"NaN in input: {torch.isnan(points).any()}", logger=logger)
+            print_log(f"Max value: {points.max()}, Min value: {points.min()}", logger=logger)
+            print_log(f"Mean value: {points.mean()}, Std: {points.std()}", logger=logger)
+            
             ret, cd_loss = base_model(points)
             loss, acc = base_model.module.get_loss_acc(ret, label)
             
             _loss = loss + 3 * cd_loss
             _loss.backward()
 
+
             # forward
             if num_iter == config.step_per_update:
                 if config.get('grad_norm_clip') is not None:
                     torch.nn.utils.clip_grad_norm_(base_model.parameters(), config.grad_norm_clip, norm_type=2)
+                # clip_value = config.get('grad_norm_clip', 1.0)  # Default clip value = 1.0
+                # torch.nn.utils.clip_grad_norm_(base_model.parameters(), clip_value, norm_type=2)
                 num_iter = 0
                 optimizer.step()
                 base_model.zero_grad()
+
+              
+            # torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=1.0, norm_type=2)
+
 
             if args.distributed:
                 loss = dist_utils.reduce_tensor(loss, args)
@@ -202,14 +229,14 @@ def run_net(args, config):
                                logger=logger)
             better = metrics.better_than(best_metrics)
             # Save ckeckpoints
-            # if better:
-            #     best_metrics = metrics
-            #     builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-best', args,
-            #                             logger=logger)
-            #     print_log(
-            #         "--------------------------------------------------------------------------------------------",
-            #         logger=logger)
-        # builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-last', args, logger=logger)
+            if better:
+                best_metrics = metrics
+                builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-best', args,
+                                        logger=logger)
+                print_log(
+                    "--------------------------------------------------------------------------------------------",
+                    logger=logger)
+        builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-last', args, logger=logger)
         
 
             
@@ -227,7 +254,7 @@ def validate(base_model, test_dataloader, epoch, args, config, best_metrics, log
             label = data[1].cuda()
 
             points = misc.fps(points, npoints)
-
+            print(points)
             embeddings, _ = base_model(points)
 
             test_pred.append(embeddings)
@@ -243,22 +270,22 @@ def validate(base_model, test_dataloader, epoch, args, config, best_metrics, log
 
         sim_matrix = F.cosine_similarity(test_pred.unsqueeze(1), test_pred.unsqueeze(0), dim=-1)  # Shape: (N, N)
         mask = test_label.unsqueeze(1) == test_label.unsqueeze(0)
+        mask.fill_diagonal_(0)  # Consistency with training
+
 
         # Calculate the number of true positives and true negatives
         threshold = 0.5  # You can adjust this threshold as needed
         predicted_similar = (sim_matrix > threshold).float()
         
-        true_positives = (predicted_similar * mask.float()).sum()
-        true_negatives = ((1 - predicted_similar) * (1 - mask.float())).sum()
-        
-        # Calculate accuracy
-        true_positives = (predicted_similar * mask).sum()
-        false_negatives = ((1 - predicted_similar) * mask).sum()  # Missed positives
-        pos_acc = true_positives / (true_positives + false_negatives) * 100.0  # Avoid divide-by-zero
-
-        # True Negatives: correctly predicted negative pairs
         true_negatives = ((1 - predicted_similar) * (~mask)).sum()
-        false_positives = (predicted_similar * (~mask)).sum()  
+        false_positives = (predicted_similar * (~mask)).sum()
+
+        true_positives = (predicted_similar * mask).sum()
+        false_negatives = ((1 - predicted_similar) * mask).sum()  
+
+        # Calculate accuracy
+        
+        pos_acc = true_positives / (true_positives + false_negatives) * 100.0  # Avoid divide-by-zero
         neg_acc = true_negatives / (true_negatives + false_positives) * 100.0
 
         # Total Accuracy

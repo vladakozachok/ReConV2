@@ -449,92 +449,36 @@ class PointTransformer(nn.Module):
         feature_dim = 768
         self.embedding_head = nn.Sequential(
             nn.Linear(feature_dim, 256),     # First layer to reduce dimensionality
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
+            nn.LayerNorm(256),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
             nn.Dropout(0.5),
             nn.Linear(256, 128),     # First layer to reduce dimensionality
-            nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True),
+            nn.LayerNorm(128),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
             nn.Dropout(0.5),
             nn.Linear(128, 64),              # Final embedding layer output size
-            nn.BatchNorm1d(64)
+            nn.LayerNorm(64)
         )
         #chamfer distance loss
         self.cd_loss = ChamferDistance()
         self.apply(self._init_weights)
 
-    # def get_loss_acc(self, embeddings, labels, temperature=0.1):
-    #     # Normalize embeddings
-    #     embeddings = F.normalize(embeddings, dim=-1)
 
-    #     # Get the number of embeddings
-    #     batch_size = embeddings.size(0)
-
-    #     # Create a mask for similar pairs
-    #     # labels = labels.contiguous().view(-1, 1)
-    #     # mask = torch.eq(labels, labels.T).float().to(embeddings.device)
-    #     # logits_mask = torch.ones_like(mask) - torch.eye(mask.size(0)).to(embeddings.device)
-    #     # mask = mask * logits_mask  # Remove self-similarities
-
-    #     labels = labels.contiguous().view(-1, 1)
-    #     mask = torch.eq(labels, labels.T).float()
-    #     mask.fill_diagonal_(0)
-
-    #     # Compute similarity matrix
-    #     sim_matrix = torch.matmul(embeddings, embeddings.T) / temperature
-
-    #     exp_sim = torch.exp(sim_matrix)
-    #     pos_term = (mask * sim_matrix).sum(1)  # Numerator
-    #     neg_term = torch.log(exp_sim.sum(1) - exp_sim.diag())
-
-    #     # # Extract positive and negative pairs
-    #     # positive_mask = mask.bool()
-    #     # negative_mask = (~mask.bool()) * logits_mask.bool()
-
-    #     # positive_pairs = similarity_matrix * positive_mask  # Shape: (batch_size, batch_size)
-    #     # negative_pairs = similarity_matrix * negative_mask  # Shape: (batch_size, batch_size)
-
-    #     # # Compute denominators for normalization
-    #     # pos_denominator = positive_pairs.sum(dim=1, keepdim=True) + 1e-8
-    #     # neg_denominator = negative_pairs.sum(dim=1, keepdim=True) + 1e-8
-
-    #     # # Compute positive loss
-    #     # pos_fraction = (positive_pairs + 1e-8) / pos_denominator
-    #     # pos_loss = -torch.log(pos_fraction + 1e-8)
-    #     # pos_loss = pos_loss.sum(dim=1) / (positive_mask.sum(dim=1) + 1e-8)
-
-    #     # # Compute negative loss
-    #     # neg_fraction = 1 - (negative_pairs + 1e-8) / neg_denominator
-    #     # neg_loss = -torch.log(neg_fraction + 1e-8)
-    #     # neg_loss = neg_loss.sum(dim=1) / (negative_mask.sum(dim=1) + 1e-8)
-
-    #     # Combine the losses
-    #     # loss = pos_loss.mean() + neg_loss.mean()
-
-    #     # # Calculate accuracy
-    #     # correct_pos = (positive_pairs > self.pos_threshold).sum().float()
-    #     # correct_neg = (negative_pairs < self.neg_threshold).sum().float()
-
-    #     # total_pos = positive_mask.sum()
-    #     # total_neg = negative_mask.sum()
-
-    #     # acc = (correct_pos + correct_neg) / (total_pos + total_neg + 1e-8) * 100
-    #     loss = -(pos_term - neg_term).mean()
-    
-    #     # ===== 4. Meaningful Accuracy =====
-    #     pos_scores = sim_matrix[mask.bool()].mean()
-    #     neg_scores = sim_matrix[~mask.bool()].mean()
-    #     acc = (pos_scores > neg_scores).float().item() * 100  # Separation check
-
-    #     return loss, acc
+        # # Attach hook to all layers
+        # for name, param in self.named_parameters():
+        #     if torch.isnan(param).any():
+        #         print_log(f"NaN detected in {name}")
 
     def get_loss_acc(self, embeddings, labels, temperature=0.1):
         # Normalize embeddings
         threshold = 0.5
-        embeddings = F.normalize(embeddings, dim=-1)
-
+        embeddings = F.normalize(embeddings, dim=-1, eps=1e-6)
+        if torch.isnan(embeddings).any():
+            print("Labels for Nan")
+            print(labels)
+            raise ValueError
         # Compute similarity matrix
-        sim_matrix = torch.matmul(embeddings, embeddings.T) #/ temperature
+        sim_matrix = F.cosine_similarity(embeddings.unsqueeze(1), embeddings.unsqueeze(0), dim=-1)
 
         # Create mask for positive pairs
         labels = labels.contiguous().view(-1, 1)
@@ -543,11 +487,15 @@ class PointTransformer(nn.Module):
 
         # Compute numerator (positive pairs) and denominator (all pairs)
         scaled_sim = sim_matrix / temperature
+        scaled_sim = torch.clamp(scaled_sim, min=-50, max=50)  # Avoid large exponentials
+
         exp_sim = torch.exp(scaled_sim)
         exp_sim = torch.clamp(exp_sim, min=1e-8)  # Ensure no value is too small
 
-        pos_term = torch.log((mask * exp_sim).sum(1) + 1e-8)  
-        neg_term = torch.log(exp_sim.sum(1) - exp_sim.diag() + 1e-8)
+        pos_term = torch.log(torch.clamp((mask * exp_sim).sum(1), min=1e-4))  
+        neg_term = torch.log(torch.clamp(exp_sim.sum(1) - exp_sim.diag(), min=1e-4))
+
+
 
         # Contrastive loss
         loss = -(pos_term - neg_term).mean()
@@ -556,13 +504,14 @@ class PointTransformer(nn.Module):
         predicted_similar = (sim_matrix > threshold).float()
 
         # True Positives: correctly predicted positive pairs
+        true_negatives = ((1 - predicted_similar) * (1 - mask)).sum()
+        false_positives = (predicted_similar * (1 - mask)).sum()
+
         true_positives = (predicted_similar * mask).sum()
         false_negatives = ((1 - predicted_similar) * mask).sum()  # Missed positives
         pos_acc = true_positives / (true_positives + false_negatives) * 100.0  # Avoid divide-by-zero
 
-        # True Negatives: correctly predicted negative pairs
-        true_negatives = ((1 - predicted_similar) * (1 - mask)).sum()
-        false_positives = (predicted_similar * (1 - mask)).sum()  # Wrongly predicted negatives as positives
+        
         neg_acc = true_negatives / (true_negatives + false_positives) * 100.0
 
         # Total Accuracy
@@ -579,9 +528,20 @@ class PointTransformer(nn.Module):
             "pos_score": pos_scores.item(),
             "neg_score": neg_scores.item(),
             "accuracy": acc,
+            "loss": loss,
             "positive_accuracy": pos_acc.item(),
             "negative_accuracy": neg_acc.item()
         })
+
+        if torch.isnan(loss):
+            print_log(scaled_sim)
+            print_log(pos_term)
+            print_log(neg_term)
+            print_log(labels)
+
+            print("NaN detected in loss!")
+
+
 
         return loss, acc
 

@@ -37,76 +37,81 @@ class YakoaDataset(Dataset):
         self.classes = {}
         collection_ids = {}
 
+        assert self.subset in ['train', 'test']
         collection_ids['train'] = self.read_text_file('train.txt')
-        collection_ids['test'] = self.read_text_file('train.txt')
+        collection_ids['test'] = self.read_text_file('validation.txt')
 
-        assert (split == 'train' or split == 'test')
+        # assert (split == 'train' or split == 'test')
         
         collection_names = [x.split('/')[1] for x in collection_ids[split]]
+        self.classes = {name: idx for idx, name in enumerate(sorted(set(collection_names)))}
 
-        
-        print(f"printing collection_names {collection_names}")
-        for idx, collection_name in enumerate(sorted(set(collection_names))):
-            self.classes[collection_name] = idx
+        self.datapath = [(collection_names[i], os.path.join("3d-assets-augmentation-with-docker", collection_ids[self.subset][i]) + '.pt')
+                         for i in range(len(collection_ids[self.subset]))]
+
+        print_log(f'The size of {self.subset} data is {len(self.datapath)}', logger='PointDetect3D')
+        # print(f"printing collection_names {collection_names}")
+        # for idx, collection_name in enumerate(sorted(set(collection_names))):
+        #     self.classes[collection_name] = idx
                         
                 
-        self.datapath = [(collection_names[i], os.path.join("3d-assets-augmentation-with-docker", collection_ids[split][i]) + '.pt') for i
-                         in range(len(collection_ids[split]))]
+        # self.datapath = [(collection_names[i], os.path.join("3d-assets-augmentation-with-docker", collection_ids[split][i]) + '.pt') for i
+        #                  in range(len(collection_ids[split]))]
         
-        self.datapath = self.datapath
+        # self.datapath = self.datapath
 
-        print_log('The size of %s data is %d' % (split, len(self.datapath)), logger='PointDetect3D')
+        # print_log('The size of %s data is %d' % (split, len(self.datapath)), logger='PointDetect3D')
 
-        if self.uniform:
-            self.save_path = 'pointdetect3d%d_%s_%dpts_fps.dat' % (self.num_category, split, self.npoints)
-        else:
-            self.save_path = 'pointdetect3d%d_%s_%dpts.dat' % (self.num_category, split, self.npoints)
+        # if self.uniform:
+        #     self.save_path = 'pointdetect3d%d_%s_%dpts_fps.dat' % (self.num_category, split, self.npoints)
+        # else:
+        #     self.save_path = 'pointdetect3d%d_%s_%dpts.dat' % (self.num_category, split, self.npoints)
 
-        if self.process_data:
-            if not os.path.exists(self.save_path):
-                print_log('Processing data %s (only running in the first time)...' % self.save_path, logger='PointDetect')
-                self.list_of_points = [None] * len(self.datapath)
-                self.list_of_labels = [None] * len(self.datapath)
+        # if self.process_data:
+        #     if not os.path.exists(self.save_path):
+        #         print_log('Processing data %s (only running in the first time)...' % self.save_path, logger='PointDetect')
+        #         self.list_of_points = [None] * len(self.datapath)
+        #         self.list_of_labels = [None] * len(self.datapath)
 
-                for index in tqdm(range(len(self.datapath)), total=len(self.datapath)):
-                    fn = self.datapath[index]
-                    print(f"cls {self.classes[self.datapath[index][0]]}")
-                    cls = self.classes[self.datapath[index][0]]
-                    cls = np.array([cls]).astype(np.int32)
+        #         for index in tqdm(range(len(self.datapath)), total=len(self.datapath)):
+        #             fn = self.datapath[index]
+        #             print(f"cls {self.classes[self.datapath[index][0]]}")
+        #             cls = self.classes[self.datapath[index][0]]
+        #             cls = np.array([cls]).astype(np.int32)
 
-                    try:
-                        points_tensor = self.download_and_extract_dat_file(fn[1])
-                        # points_tensor = torch.tensor(np_points, dtype=torch.float)
+        #             try:
+        #                 points_tensor = self.download_and_extract_dat_file(fn[1])
+        #                 # points_tensor = torch.tensor(np_points, dtype=torch.float)
 
-                    except Exception as e:
-                        print(f"Failed to read data from {fn[1]}: {e}")
-                        continue  # Skip this file and move on to the next
+        #             except Exception as e:
+        #                 print(f"Failed to read data from {fn[1]}: {e}")
+        #                 continue  # Skip this file and move on to the next
 
-                    self.list_of_points[index] = points_tensor
-                    self.list_of_labels[index] = cls
+        #             self.list_of_points[index] = points_tensor
+        #             self.list_of_labels[index] = cls
 
-                # with open(self.save_path, 'wb') as f:
-                #     pickle.dump([self.list_of_points, self.list_of_labels], f)
-            else:
-                print_log('Load processed data from %s...' % self.save_path, logger='ModelNet')
-                with open(self.save_path, 'rb') as f:
-                    self.list_of_points, self.list_of_labels = pickle.load(f)
+        #         with open(self.save_path, 'wb') as f:
+        #             pickle.dump([self.list_of_points, self.list_of_labels], f)
+        #     else:
+        #         print_log('Load processed data from %s...' % self.save_path, logger='ModelNet')
+        #         with open(self.save_path, 'rb') as f:
+        #             self.list_of_points, self.list_of_labels = pickle.load(f)
 
     def __len__(self):
         return len(self.datapath)
 
     def __getitem__(self, index):
       # Retrieve the points and label for the given index directly as they are already tensors
-      point_set = self.list_of_points[index]
-      label = self.list_of_labels[index]
 
       fn = self.datapath[index]
-      cls = self.classes[self.datapath[index][0]]
+      cls = self.classes[fn[0]]
       label = np.array([cls]).astype(np.int32)
 
-    #   print(f"point_set: {point_set}")
-    #   print(f"label[0]: {label[0]}")
-
+      try:
+        point_set = self.download_and_extract_dat_file(fn[1])  # Download when needed
+      except Exception as e:
+        print_log(f"Failed to read data from {fn[1]}: {e}")
+        point_set = torch.zeros((8192, 3))
       return 'PointDetect3D', 'sample', (point_set, label[0])
 
     def read_text_file(self, file_path):
@@ -134,7 +139,7 @@ class YakoaDataset(Dataset):
 
         except Exception as e:
             print(f"Error reading the file {temp_file_path}: {e}")
-            points_tensor = torch.tensor([])  # Return an empty tensor in case of error
+            # points_tensor = torch.tensor([])  # Return an empty tensor in case of error
 
         finally:
             # Clean up the temporary file
