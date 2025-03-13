@@ -8,8 +8,6 @@ from utils.logger import *
 from utils.misc import *
 from timm.scheduler import CosineLRScheduler
 
-
-
 def dataset_builder(args, config):
     dataset = build_dataset_from_cfg(config._base_, config.others)
     shuffle = config.others.subset == 'train'
@@ -22,23 +20,24 @@ def dataset_builder(args, config):
         dataset += extra_dataset
 
     if args.distributed:
-        sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=False) #Shuffle
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.others.bs,
-                                                 num_workers=int(args.num_workers),
-                                                 drop_last=config.others.subset == 'train',
-                                                 worker_init_fn=worker_init_fn,
-                                                 pin_memory=True,
-                                                 sampler=sampler)
+        sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=False)
+        dataloader = DataLoader(dataset,
+                                batch_size=config.others.bs,
+                                num_workers=int(args.num_workers),
+                                drop_last=config.others.subset == 'train',
+                                worker_init_fn=worker_init_fn,
+                                pin_memory=True,
+                                sampler=sampler)
     else:
         sampler = None
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.others.bs,
-                                                 shuffle=False,
-                                                 drop_last=config.others.subset == 'train',
-                                                 num_workers=int(args.num_workers),
-                                                 pin_memory=True,
-                                                 worker_init_fn=worker_init_fn)
+        # Use the custom batch sampler that ensures each batch has a similar pair.
+        batch_sampler = SimilarPairBatchSampler(dataset, batch_size=config.others.bs)
+        dataloader = DataLoader(dataset,
+                                batch_sampler=batch_sampler,
+                                num_workers=int(args.num_workers),
+                                pin_memory=True,
+                                worker_init_fn=worker_init_fn)
     return sampler, dataloader
-
 
 def model_builder(config):
     model = build_model_from_cfg(config)
@@ -203,101 +202,91 @@ def load_model(base_model, ckpt_path, logger=None):
     print_log(f'ckpts @ {epoch} epoch( performance = {str(metrics):s})', logger=logger)
     return
 
-# import torch
-# import random
-# from collections import defaultdict
-# from torch.utils.data import DataLoader, Sampler
+import random
+import torch
+from torch.utils.data import DataLoader, Sampler
 
-# # Custom batch sampler that groups samples using the 2222 / 233 logic.
-# class CustomBatchSampler(Sampler):
-#     def __init__(self, dataset):
-#         # Build mapping from asset_id to list of sample indices.
-#         self.asset2indices = defaultdict(list)
-#         for idx, sample in enumerate(dataset):
-#             asset_id = sample["asset_id"]  # each sample must have an "asset_id" field
-#             self.asset2indices[asset_id].append(idx)
-#         # Only consider assets that have at least 11 augmentations;
-#         # if an asset has more than 11, we only keep the first 11 (after shuffling).
-#         self.assets = []
-#         for asset, indices in self.asset2indices.items():
-#             if len(indices) >= 11:
-#                 random.shuffle(indices)  # shuffle indices within the asset
-#                 self.asset2indices[asset] = indices[:11]
-#                 self.assets.append(asset)
-#         # Shuffle the list of eligible assets.
-#         random.shuffle(self.assets)
+class SimilarPairBatchSampler(Sampler):
+    def __init__(self, dataset, batch_size=10):
+        """
+        Args:
+            dataset: Your dataset instance. It must have an attribute `datapath` which is a list of tuples,
+                     where the first element is the asset identifier.
+            batch_size: Number of samples per batch (e.g. 10).
+        """
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.num_samples = len(dataset)
+        
+        # Build a mapping from asset id to list of indices.
+        self.asset_to_indices = {}
+        for idx, (asset, _) in enumerate(dataset.datapath):
+            self.asset_to_indices.setdefault(asset, []).append(idx)
 
-#     def __iter__(self):
-#         # Make a working copy of the assets list.
-#         assets_list = self.assets.copy()
-#         batches = []
-#         while len(assets_list) >= 4:
-#             # --- Batch Type 1: 2-2-2-2 ---
-#             # Select 4 unique assets at random.
-#             batch1_assets = random.sample(assets_list, 4)
-#             batch1 = []
-#             for asset in batch1_assets:
-#                 # Each asset contributes its first 2 samples.
-#                 batch1.extend(self.asset2indices[asset][:2])
-#                 self.asset2indices[asset] = self.asset2indices[asset][2:]
-#                 # If the asset no longer has at least 2 samples for a 2222 batch, remove it.
-#                 if len(self.asset2indices[asset]) < 2:
-#                     assets_list.remove(asset)
-#             batches.append(batch1)
+    def __iter__(self):
+        # Copy of all indices that haven't been used yet.
+        remaining = set(range(self.num_samples))
+        batches = []
+        
+        while len(remaining) >= self.batch_size:
+            # Build candidate list: assets with at least 2 available samples.
+            candidate_assets = []
+            for asset, indices in self.asset_to_indices.items():
+                available = [i for i in indices if i in remaining]
+                if len(available) >= 2:
+                    candidate_assets.append((asset, available))
+            
+            pairs = []
+            # We need to form two similar pairs (i.e. 4 samples).
+            if len(candidate_assets) >= 2:
+                # Choose two distinct assets.
+                chosen = random.sample(candidate_assets, 2)
+                for asset, available in chosen:
+                    pair = random.sample(available, 2)
+                    pairs.append(pair)
+            elif len(candidate_assets) == 1:
+                # Only one asset qualifies; see if it has at least 4 available samples.
+                asset, available = candidate_assets[0]
+                if len(available) >= 4:
+                    sampled = random.sample(available, 4)
+                    pairs.append(sampled[:2])
+                    pairs.append(sampled[2:4])
+                else:
+                    # Cannot form two pairs from a single asset.
+                    break
+            else:
+                # No asset available to form even one pair.
+                break
+            
+            # Remove the indices chosen for the two pairs from the remaining set.
+            for pair in pairs:
+                for idx in pair:
+                    remaining.remove(idx)
+            
+            batch = []
+            for pair in pairs:
+                batch.extend(pair)
+            
+            # Fill the rest of the batch with random samples from the remaining indices.
+            remaining_to_fill = self.batch_size - 4
+            if len(remaining) < remaining_to_fill:
+                break
+            additional = random.sample(remaining, remaining_to_fill)
+            for idx in additional:
+                remaining.remove(idx)
+            batch.extend(additional)
+            
+            # Shuffle the batch so the pair positions are not fixed.
+            random.shuffle(batch)
+            batches.append(batch)
+        
+        # Optionally yield any leftover indices in a final (smaller) batch.
+        if remaining:
+            batches.append(list(remaining))
+        
+        for batch in batches:
+            yield batch
 
-#             # --- Batch Type 2: 2-3-3 ---
-#             if len(assets_list) >= 3:
-#                 batch2_assets = random.sample(assets_list, 3)
-#                 batch2 = []
-#                 # First asset contributes 2 samples.
-#                 batch2.extend(self.asset2indices[batch2_assets[0]][:2])
-#                 self.asset2indices[batch2_assets[0]] = self.asset2indices[batch2_assets[0]][2:]
-#                 # Next two assets contribute 3 samples each.
-#                 for asset in batch2_assets[1:]:
-#                     batch2.extend(self.asset2indices[asset][:3])
-#                     self.asset2indices[asset] = self.asset2indices[asset][3:]
-#                     if len(self.asset2indices[asset]) < 3:
-#                         assets_list.remove(asset)
-#                 batches.append(batch2)
-#         # Finally, shuffle the order of the batches.
-#         random.shuffle(batches)
-#         for batch in batches:
-#             yield batch
+    def __len__(self):
+        return self.num_samples // self.batch_size
 
-#     def __len__(self):
-#         # It can be challenging to compute the exact number of batches beforehand.
-#         return 0  # This value is not used by DataLoader when using batch_sampler.
-
-# # Integration into dataset_builder.
-# def dataset_builder(args, config):
-#     dataset = build_dataset_from_cfg(config._base_, config.others)
-#     shuffle = config.others.subset == 'train'
-
-#     if config.get('extra_train') is not None:
-#         config.extra_train.others.img = config.others.img
-#         config.extra_train.others.text = config.others.text
-#         config.extra_train.others.img_views = config.others.img_views
-#         extra_dataset = build_dataset_from_cfg(config.extra_train._base_, config.extra_train.others)
-#         dataset += extra_dataset
-
-#     # Create our custom batch sampler from the dataset.
-#     custom_batch_sampler = CustomBatchSampler(dataset)
-
-#     if args.distributed:
-#         # When distributed, you might still need a DistributedSampler.
-#         # One option is to wrap your dataset with DistributedSampler first
-#         # and then apply your custom batching on top of that.
-#         sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=False)
-#         dataloader = DataLoader(dataset, batch_sampler=custom_batch_sampler,
-#                                 num_workers=int(args.num_workers),
-#                                 drop_last=config.others.subset == 'train',
-#                                 worker_init_fn=worker_init_fn,
-#                                 pin_memory=True)
-#     else:
-#         sampler = None
-#         dataloader = DataLoader(dataset, batch_sampler=custom_batch_sampler,
-#                                 num_workers=int(args.num_workers),
-#                                 drop_last=config.others.subset == 'train',
-#                                 pin_memory=True,
-#                                 worker_init_fn=worker_init_fn)
-#     return sampler, dataloader
