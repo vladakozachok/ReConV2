@@ -212,81 +212,53 @@ class SimilarPairBatchSampler(Sampler):
         Args:
             dataset: Your dataset instance. It must have an attribute `datapath` which is a list of tuples,
                      where the first element is the asset identifier.
-            batch_size: Number of samples per batch (e.g. 10).
+            batch_size: Number of samples per batch (should be 10 in this case).
         """
+        # assert batch_size == 10, "This sampler is designed for batch_size of 10."
         self.dataset = dataset
         self.batch_size = batch_size
         self.num_samples = len(dataset)
         
-        # Build a mapping from asset id to list of indices.
+        # Build a mapping from asset id to a list of indices.
         self.asset_to_indices = {}
         for idx, (asset, _) in enumerate(dataset.datapath):
             self.asset_to_indices.setdefault(asset, []).append(idx)
-
+    
     def __iter__(self):
-        # Copy of all indices that haven't been used yet.
-        remaining = set(range(self.num_samples))
-        batches = []
+        # Create a local copy (per epoch) of the available indices per asset.
+        available = {asset: indices.copy() for asset, indices in self.asset_to_indices.items()}
         
-        while len(remaining) >= self.batch_size:
-            # Build candidate list: assets with at least 2 available samples.
-            candidate_assets = []
-            for asset, indices in self.asset_to_indices.items():
-                available = [i for i in indices if i in remaining]
-                if len(available) >= 2:
-                    candidate_assets.append((asset, available))
-            
-            pairs = []
-            # We need to form two similar pairs (i.e. 4 samples).
-            if len(candidate_assets) >= 2:
-                # Choose two distinct assets.
-                chosen = random.sample(candidate_assets, 2)
-                for asset, available in chosen:
-                    pair = random.sample(available, 2)
-                    pairs.append(pair)
-            elif len(candidate_assets) == 1:
-                # Only one asset qualifies; see if it has at least 4 available samples.
-                asset, available = candidate_assets[0]
-                if len(available) >= 4:
-                    sampled = random.sample(available, 4)
-                    pairs.append(sampled[:2])
-                    pairs.append(sampled[2:4])
-                else:
-                    # Cannot form two pairs from a single asset.
-                    break
-            else:
-                # No asset available to form even one pair.
+        batches = []
+        # Continue until we can no longer form a full batch.
+        while True:
+            # Build a list of candidate assets that have at least 2 samples remaining.
+            candidate_assets = [asset for asset, inds in available.items() if len(inds) >= 2]
+            if len(candidate_assets) < 5:
+                # Not enough assets to form 5 distinct pairs.
                 break
             
-            # Remove the indices chosen for the two pairs from the remaining set.
-            for pair in pairs:
-                for idx in pair:
-                    remaining.remove(idx)
-            
+            # Randomly select 5 distinct assets.
+            chosen_assets = random.sample(candidate_assets, 5)
             batch = []
-            for pair in pairs:
+            # For each asset, randomly sample 2 indices.
+            for asset in chosen_assets:
+                inds = available[asset]
+                pair = random.sample(inds, 2)
                 batch.extend(pair)
-            
-            # Fill the rest of the batch with random samples from the remaining indices.
-            remaining_to_fill = self.batch_size - 4
-            if len(remaining) < remaining_to_fill:
-                break
-            additional = random.sample(remaining, remaining_to_fill)
-            for idx in additional:
-                remaining.remove(idx)
-            batch.extend(additional)
-            
-            # Shuffle the batch so the pair positions are not fixed.
+                # Remove the chosen indices from the available pool.
+                for i in pair:
+                    available[asset].remove(i)
+            # Shuffle the batch order.
             random.shuffle(batch)
             batches.append(batch)
         
-        # Optionally yield any leftover indices in a final (smaller) batch.
-        if remaining:
-            batches.append(list(remaining))
-        
+        # Yield each batch.
         for batch in batches:
             yield batch
 
     def __len__(self):
-        return self.num_samples // self.batch_size
+        # Estimate the number of full batches by summing pairs available across assets
+        total_pairs = sum(len(inds) // 2 for inds in self.asset_to_indices.values())
+        # Each batch requires 5 distinct pairs.
+        return total_pairs // 5
 
