@@ -34,14 +34,14 @@ class YakoaDataset(Dataset):
         collection_ids = {}
 
         assert self.subset in ['train', 'test']
-        collection_ids['train'] = self.read_text_file('train.txt')
+        collection_ids['train'] = self.read_text_file('train_full_up_no_noise.txt')
         collection_ids['test'] = self.read_text_file('validation.txt')
 
         
         collection_names = [x.split('/')[1] for x in collection_ids[split]]
         self.classes = {name: idx for idx, name in enumerate(sorted(set(collection_names)))}
 
-        self.datapath = [(collection_names[i], os.path.join("3d-assets-augmentation-with-docker", collection_ids[self.subset][i]) + '.pt')
+        self.datapath = [(collection_names[i], os.path.join("3d-assets-augmentation-with-docker", collection_ids[self.subset][i]) + '_normalized'+'.pt')
                          for i in range(len(collection_ids[self.subset]))]
         
         print_log(f'The size of {self.subset} data is {len(self.datapath)}', logger='PointDetect3D')
@@ -56,7 +56,7 @@ class YakoaDataset(Dataset):
       fn = self.datapath[index]
       cls = self.classes[fn[0]]
       label = np.array([cls]).astype(np.int32)
-      
+      name, _ = fn[0].split('-', 1)
     #   print(f"index : {index}")
     #   print(f"class : {cls}")
     #   print(f"label : {label}")
@@ -66,7 +66,7 @@ class YakoaDataset(Dataset):
       except Exception as e:
         print_log(f"Failed to read data from {fn[1]}: {e}")
         point_set = torch.zeros((8192, 3))
-      return 'PointDetect3D', 'sample', (point_set, label[0])
+      return 'PointDetect3D', 'sample', (point_set, label[0], name)
 
     def read_text_file(self, file_path):
         blob = self.bucket.blob(file_path)
@@ -74,7 +74,6 @@ class YakoaDataset(Dataset):
 
         
     def download_and_extract_dat_file(self, blob_name):
-        print(blob_name)
         blob = self.bucket.blob(blob_name)
         _, extension = os.path.splitext(blob_name)
 

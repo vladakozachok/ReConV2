@@ -128,6 +128,7 @@ def run_net(args, config):
 
             points = data[0].cuda()
             label = data[1].cuda()
+            name = data[2]
 
             if npoints == 1024:
                 point_all = 1200
@@ -156,19 +157,24 @@ def run_net(args, config):
             range_vals = max_vals - min_vals
             range_vals = torch.clamp(range_vals, min=1e-6)  # To prevent division by zero
 
-            # Normalize to [0, 1]
-            normalized_points = (points - min_vals) / range_vals
-            points = train_transforms(normalized_points)
+            # # Normalize to [0, 1]
+            # normalized_points = (points - min_vals) / range_vals
+            # points = train_transforms(normalized_points)
             
-            print_log("Checking input tensor for NaNs...", logger=logger)
-            print_log(f"NaN in input: {torch.isnan(points).any()}", logger=logger)
-            print_log(f"Max value: {points.max()}, Min value: {points.min()}", logger=logger)
-            print_log(f"Mean value: {points.mean()}, Std: {points.std()}", logger=logger)
+            # print_log("Checking input tensor for NaNs...", logger=logger)
+            # print_log(f"NaN in input: {torch.isnan(points).any()}", logger=logger)
+            # print_log(f"Max value: {points.max()}, Min value: {points.min()}", logger=logger)
+            # print_log(f"Mean value: {points.mean()}, Std: {points.std()}", logger=logger)
             
             ret, cd_loss = base_model(points)
-            loss, acc = base_model.module.get_loss_acc(ret, label)
+            loss, acc = base_model.module.get_loss_acc(ret, label, name)
             
-            _loss = loss + 3 * cd_loss
+            if loss is None or acc is None:
+                print(f"Skipping batch {idx} due to NaN values in embeddings or loss/accuracy.")
+                print_log(f"Contracts that give NaN: {name}")
+                continue 
+            
+            _loss = loss  + 3 * cd_loss
             _loss.backward()
 
 
@@ -223,10 +229,11 @@ def run_net(args, config):
                    optimizer.param_groups[0]['lr']), logger=logger)
 
         # if epoch % args.val_freq == 0 and epoch != 0:
-        if epoch % 1 == 0:
+        if epoch %1 ==0:
             # Validate the current model
             metrics = validate(base_model, test_dataloader, epoch, args, config, best_metrics,
                                logger=logger)
+
             better = metrics.better_than(best_metrics)
             # Save ckeckpoints
             if better:
@@ -247,18 +254,20 @@ def validate(base_model, test_dataloader, epoch, args, config, best_metrics, log
 
     test_pred = []
     test_label = []
+    test_name = []
     npoints = config.npoints
     with torch.no_grad():
         for idx, (taxonomy_ids, model_ids, data) in enumerate(test_dataloader):
             points = data[0].cuda()
             label = data[1].cuda()
+            name = data[2]
 
             points = misc.fps(points, npoints)
-            print(points)
             embeddings, _ = base_model(points)
 
             test_pred.append(embeddings)
             test_label.append(label)
+            test_name.extend(name)
         
 
         test_pred = torch.cat(test_pred, dim=0)
@@ -268,28 +277,49 @@ def validate(base_model, test_dataloader, epoch, args, config, best_metrics, log
             test_pred = dist_utils.gather_tensor(test_pred, args)
             test_label = dist_utils.gather_tensor(test_label, args)
 
-        sim_matrix = F.cosine_similarity(test_pred.unsqueeze(1), test_pred.unsqueeze(0), dim=-1)  # Shape: (N, N)
-        mask = test_label.unsqueeze(1) == test_label.unsqueeze(0)
-        mask.fill_diagonal_(0)  # Consistency with training
+        test_label = test_label.contiguous().view(-1, 1)
+       
 
+        sim_matrix = F.cosine_similarity(test_pred.unsqueeze(1), test_pred.unsqueeze(0), dim=-1)  # Shape: (N, N)
+        positive_mask = torch.eq(test_label, test_label.T).float()
+        triangular_mask = torch.triu(torch.ones_like(positive_mask), diagonal=1).to(test_label.device)
+        positive_mask.fill_diagonal_(0)  # Remove self-similarities
+        positive_mask = positive_mask * triangular_mask
+        contract_to_index = {contract: idx for idx, contract in enumerate(sorted(set(test_name)))}
+        contract_indices = [contract_to_index[contract] for contract in test_name]
+        contract_tensor = torch.tensor(contract_indices)
+        unique_contracts, contract_indices = contract_tensor.unique(return_inverse=True)
+        contract_mask = (contract_indices.unsqueeze(0) == contract_indices.unsqueeze(1)).float()
+        negative_mask = 1 - contract_mask
+        negative_mask.fill_diagonal_(0)
+        negative_mask = negative_mask.to(test_label.device)
+        negative_mask = negative_mask * triangular_mask
+        # final_mask = positive_mask + negative_mask
 
         # Calculate the number of true positives and true negatives
         threshold = 0.5  # You can adjust this threshold as needed
-        predicted_similar = (sim_matrix > threshold).float()
+        predicted_positive= (sim_matrix > threshold).float()
+        predicted_negative = 1-predicted_positive
         
-        true_negatives = ((1 - predicted_similar) * (~mask)).sum()
-        false_positives = (predicted_similar * (~mask)).sum()
+        true_positives = (predicted_positive * positive_mask).sum()
+        false_negatives = ((1 - predicted_positive) * positive_mask).sum()
 
-        true_positives = (predicted_similar * mask).sum()
-        false_negatives = ((1 - predicted_similar) * mask).sum()  
+        # True Negatives and False Positives
+        true_negatives = (predicted_negative * negative_mask).sum()
+        false_positives = ((1 - predicted_negative) * negative_mask).sum()
 
         # Calculate accuracy
         
         pos_acc = true_positives / (true_positives + false_negatives) * 100.0  # Avoid divide-by-zero
         neg_acc = true_negatives / (true_negatives + false_positives) * 100.0
 
+        precision = true_positives/(true_positives+false_positives)
+        recall = true_positives/(true_positives+false_negatives)
+        f1 = 2 * (precision*recall)/(precision+recall) if (precision+recall) != 0 else 0
+
+
         # Total Accuracy
-        total_pairs = mask.numel()
+        total_pairs = positive_mask.sum() + negative_mask.sum()
         correct_predictions = true_positives + true_negatives
         acc = (correct_predictions / total_pairs) * 100.0
 
@@ -298,7 +328,10 @@ def validate(base_model, test_dataloader, epoch, args, config, best_metrics, log
         wandb.log({
                 "val_acc": acc,
                 "val_pos_acc": pos_acc,
-                "val_neg_acc": neg_acc
+                "val_neg_acc": neg_acc,
+                "val_precision": precision,
+                "val_recall": recall,
+                "val_f1": f1,
             })
 
         if args.distributed:

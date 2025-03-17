@@ -377,7 +377,6 @@ class ReCon2(nn.Module):
         losses['csc_img'] = self.contrast_loss(img_token, img)
         losses['csc_text'] = self.contrast_loss(text_token, text)
 
-        print(losses)
         loss = sum(losses.values())
         return loss
 
@@ -469,76 +468,121 @@ class PointTransformer(nn.Module):
         #     if torch.isnan(param).any():
         #         print_log(f"NaN detected in {name}")
 
-    def get_loss_acc(self, embeddings, labels, temperature=0.1):
+    def get_loss_acc(self, embeddings, labels, names, temperature=0.1):
         # Normalize embeddings
-        threshold = 0.5
+        pos_threshold = 0.5
+        neg_threshold = 0.5
         embeddings = F.normalize(embeddings, dim=-1, eps=1e-6)
         if torch.isnan(embeddings).any():
             print("Labels for Nan")
             print(labels)
-            raise ValueError
-        # Compute similarity matrix
+            return None, None
+        
         sim_matrix = F.cosine_similarity(embeddings.unsqueeze(1), embeddings.unsqueeze(0), dim=-1)
-
+        
         # Create mask for positive pairs
         labels = labels.contiguous().view(-1, 1)
-        mask = torch.eq(labels, labels.T).float()
-        mask.fill_diagonal_(0)  # Remove self-similarities
+        positive_mask = torch.eq(labels, labels.T).float()
+        positive_mask.fill_diagonal_(0)  # Remove self-similarities
+        triangular_mask = torch.triu(torch.ones_like(positive_mask), diagonal=1).to(labels.device)
+        positive_mask = positive_mask * triangular_mask
+        contract_to_index = {contract: idx for idx, contract in enumerate(sorted(set(names)))}
+        contract_indices = [contract_to_index[contract] for contract in names]
+        contract_tensor = torch.tensor(contract_indices)
+        unique_contracts, contract_indices = contract_tensor.unique(return_inverse=True)
+        contract_mask = (contract_indices.unsqueeze(0) == contract_indices.unsqueeze(1)).float()
+        negative_mask = 1 - contract_mask
+        negative_mask.fill_diagonal_(0)
+        negative_mask = negative_mask.to(labels.device)
+        negative_mask = negative_mask * triangular_mask
+        # final_mask = positive_mask + negative_mask
 
         # Compute numerator (positive pairs) and denominator (all pairs)
-        scaled_sim = sim_matrix / temperature
-        scaled_sim = torch.clamp(scaled_sim, min=-50, max=50)  # Avoid large exponentials
+        # scaled_sim = sim_matrix / temperature
+        # scaled_sim = torch.clamp(scaled_sim, min=-10, max=10)  # Avoid large exponentials
 
-        exp_sim = torch.exp(scaled_sim)
-        exp_sim = torch.clamp(exp_sim, min=1e-8)  # Ensure no value is too small
+        # exp_sim = torch.exp(scaled_sim)
+        # exp_sim = torch.clamp(exp_sim, min=1e-8)  # Ensure no value is too small
 
-        pos_term = torch.log(torch.clamp((mask * exp_sim).sum(1), min=1e-4))  
-        neg_term = torch.log(torch.clamp(exp_sim.sum(1) - exp_sim.diag(), min=1e-4))
+        # pos_term = torch.log(torch.clamp((positive_mask * exp_sim).sum(1), min=1e-4))  
+        # neg_term = torch.log(torch.clamp((negative_mask * exp_sim).sum(1), min=1e-4))
 
+        # margin = 1
+        # # Contrastive loss
+        # loss = -(pos_term - (neg_term+margin)).mean()
 
+        # predicted_probs = torch.sigmoid(scaled_sim)  # Apply sigmoid to scaled similarity
 
-        # Contrastive loss
-        loss = -(pos_term - neg_term).mean()
+        # # Calculate Binary Cross-Entropy (BCE) loss for positive and negative pairs
+        # # For positive pairs, we want the predicted similarity to be 1 (i.e., high similarity)
+        # pos_loss = -positive_mask * torch.log(predicted_probs + 1e-8)  # Prevent log(0)
+
+        # # For negative pairs, we want the predicted similarity to be 0 (i.e., low similarity)
+        # neg_loss = -negative_mask * torch.log(1 - predicted_probs + 1e-8)  # Prevent log(0)
+
+        # loss = (pos_loss + neg_loss).sum() / (positive_mask.sum() + negative_mask.sum())
+        margin = 1.1
+        pos_loss = (1 - sim_matrix)**2 * positive_mask 
+        neg_term = F.relu(sim_matrix + 1 - margin)  # Only penalise if above -1+margin
+        neg_loss = neg_term**2 * negative_mask
+
+        pos_loss = pos_loss.sum() #/positive_mask.sum()
+        neg_loss = neg_loss.sum() #/negative_mask.sum()
+
+        # Average over all valid pairs to get final loss
+        denom = (positive_mask.sum() + negative_mask.sum()).clamp_min(1e-8)
+        loss = 13 * (pos_loss.sum()  + neg_loss.sum()) / denom 
 
         # ===== Threshold-Based Accuracy =====
-        predicted_similar = (sim_matrix > threshold).float()
+        predicted_positive = (sim_matrix > pos_threshold).float()
+        predicted_negative = (sim_matrix < neg_threshold).float()
 
         # True Positives: correctly predicted positive pairs
-        true_negatives = ((1 - predicted_similar) * (1 - mask)).sum()
-        false_positives = (predicted_similar * (1 - mask)).sum()
+        true_positives = (predicted_positive * positive_mask).sum()
+        false_negatives = ((1 - predicted_positive) * positive_mask).sum()
 
-        true_positives = (predicted_similar * mask).sum()
-        false_negatives = ((1 - predicted_similar) * mask).sum()  # Missed positives
+        # True Negatives and False Positives
+        true_negatives = (predicted_negative * negative_mask).sum()
+        false_positives = ((1 - predicted_negative) * negative_mask).sum()
         pos_acc = true_positives / (true_positives + false_negatives) * 100.0  # Avoid divide-by-zero
-
-        
         neg_acc = true_negatives / (true_negatives + false_positives) * 100.0
 
+        precision = true_positives/(true_positives+false_positives) if (true_positives+ false_positives) !=0 else 0
+        recall = true_positives/(true_positives+false_negatives)
+        f1 = 2 * (precision*recall)/(precision+recall) if (precision+recall) != 0 else 0
+
         # Total Accuracy
-        total_pairs = mask.numel()
+        total_pairs = positive_mask.sum() + negative_mask.sum()
         correct_predictions = true_positives + true_negatives
         acc = (correct_predictions / total_pairs) * 100.0
 
         # Compute mean positive & negative similarity scores
-        pos_scores = sim_matrix[mask.bool()].mean()
-        neg_scores = sim_matrix[~mask.bool()].mean()
+        pos_scores = sim_matrix[positive_mask.bool()]  # Extract positive pair scores
+        neg_scores = sim_matrix[negative_mask.bool()]  # Extract negative pair scores
 
+        # Compute the average similarity for positive and negative pairs
+        average_pos_score = pos_scores.mean().item()  # Average of positive scores
+        average_neg_score = neg_scores.mean().item()  # Average of negative scores
+    
         # Log to wandb
         wandb.log({
-            "pos_score": pos_scores.item(),
-            "neg_score": neg_scores.item(),
             "accuracy": acc,
             "loss": loss,
             "positive_accuracy": pos_acc.item(),
-            "negative_accuracy": neg_acc.item()
+            "negative_accuracy": neg_acc.item(),
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "pos_score": average_pos_score,
+            "neg_score": average_neg_score,
         })
 
+        
         if torch.isnan(loss):
             print_log(scaled_sim)
             print_log(pos_term)
             print_log(neg_term)
             print_log(labels)
-
             print("NaN detected in loss!")
 
 
@@ -640,5 +684,5 @@ class PointTransformer(nn.Module):
 
         point_cloud_embedding = torch.mean(encoded_features, dim=1)
         ret = self.embedding_head(point_cloud_embedding)
-
+        ret = F.normalize(ret, p=2, dim=1) 
         return ret, cd_l1_loss + cd_l2_loss
