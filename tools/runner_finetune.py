@@ -170,8 +170,11 @@ def run_net(args, config):
             loss, acc = base_model.module.get_loss_acc(ret, label, name)
             
             if loss is None or acc is None:
+                
                 print(f"Skipping batch {idx} due to NaN values in embeddings or loss/accuracy.")
-                print_log(f"Contracts that give NaN: {name}")
+                print_log(f"Contracts that give NaN: {name}", logger = logger)
+                del points, label, name, ret, cd_loss, loss, acc
+                torch.cuda.empty_cache()
                 continue 
             
             _loss = loss  + 3 * cd_loss
@@ -256,6 +259,7 @@ def validate(base_model, test_dataloader, epoch, args, config, best_metrics, log
     test_label = []
     test_name = []
     npoints = config.npoints
+
     with torch.no_grad():
         for idx, (taxonomy_ids, model_ids, data) in enumerate(test_dataloader):
             points = data[0].cuda()
@@ -277,61 +281,25 @@ def validate(base_model, test_dataloader, epoch, args, config, best_metrics, log
             test_pred = dist_utils.gather_tensor(test_pred, args)
             test_label = dist_utils.gather_tensor(test_label, args)
 
-        test_label = test_label.contiguous().view(-1, 1)
-       
-
-        sim_matrix = F.cosine_similarity(test_pred.unsqueeze(1), test_pred.unsqueeze(0), dim=-1)  # Shape: (N, N)
-        positive_mask = torch.eq(test_label, test_label.T).float()
-        triangular_mask = torch.triu(torch.ones_like(positive_mask), diagonal=1).to(test_label.device)
-        positive_mask.fill_diagonal_(0)  # Remove self-similarities
-        positive_mask = positive_mask * triangular_mask
-        contract_to_index = {contract: idx for idx, contract in enumerate(sorted(set(test_name)))}
-        contract_indices = [contract_to_index[contract] for contract in test_name]
-        contract_tensor = torch.tensor(contract_indices)
-        unique_contracts, contract_indices = contract_tensor.unique(return_inverse=True)
-        contract_mask = (contract_indices.unsqueeze(0) == contract_indices.unsqueeze(1)).float()
-        negative_mask = 1 - contract_mask
-        negative_mask.fill_diagonal_(0)
-        negative_mask = negative_mask.to(test_label.device)
-        negative_mask = negative_mask * triangular_mask
-        # final_mask = positive_mask + negative_mask
-
-        # Calculate the number of true positives and true negatives
-        threshold = 0.5  # You can adjust this threshold as needed
-        predicted_positive= (sim_matrix > threshold).float()
-        predicted_negative = 1-predicted_positive
+        test_pred = F.normalize(test_pred, p=2, dim=1)
+        sim_matrix = F.cosine_similarity(test_pred.unsqueeze(1), test_pred.unsqueeze(0), dim=-1) 
+        sim_matrix.fill_diagonal_(-float('inf'))
+        top1_indices = torch.argmax(sim_matrix, dim=1)
         
-        true_positives = (predicted_positive * positive_mask).sum()
-        false_negatives = ((1 - predicted_positive) * positive_mask).sum()
+        labels = test_label.view(-1)  # Flatten labels to shape (N,)
+        num_samples = labels.size(0)
 
-        # True Negatives and False Positives
-        true_negatives = (predicted_negative * negative_mask).sum()
-        false_positives = ((1 - predicted_negative) * negative_mask).sum()
+        top1_labels = labels[top1_indices]
+        correct_top1 = (top1_labels == labels).float().sum().item()
+        top1_accuracy = correct_top1 / num_samples * 100.0
 
-        # Calculate accuracy
-        
-        pos_acc = true_positives / (true_positives + false_negatives) * 100.0  # Avoid divide-by-zero
-        neg_acc = true_negatives / (true_negatives + false_positives) * 100.0
+        acc = top1_accuracy
 
-        precision = true_positives/(true_positives+false_positives)
-        recall = true_positives/(true_positives+false_negatives)
-        f1 = 2 * (precision*recall)/(precision+recall) if (precision+recall) != 0 else 0
-
-
-        # Total Accuracy
-        total_pairs = positive_mask.sum() + negative_mask.sum()
-        correct_predictions = true_positives + true_negatives
-        acc = (correct_predictions / total_pairs) * 100.0
 
         print_log('[Validation Similarity] EPOCH: %d  accuracy = %.4f' % (epoch, acc), logger=logger)
 
         wandb.log({
-                "val_acc": acc,
-                "val_pos_acc": pos_acc,
-                "val_neg_acc": neg_acc,
-                "val_precision": precision,
-                "val_recall": recall,
-                "val_f1": f1,
+                "val_top1_acc": acc,
             })
 
         if args.distributed:
@@ -386,30 +354,51 @@ def validate_vote(base_model, test_dataloader, epoch, args, config, logger=None,
                 embeddings, _ = base_model(transformed_points)
                 local_preds.append(embeddings.unsqueeze(0))
 
-            # Average the embeddings across all passes
-            averaged_embeddings = torch.cat(local_preds, dim=0).mean(0)
+            test_pred = F.normalize(test_pred, p=2, dim=1)
+            sim_matrix = F.cosine_similarity(test_pred.unsqueeze(1), test_pred.unsqueeze(0), dim=-1)
+            sim_matrix.fill_diagonal_(-float('inf'))  # exclude self-similarity
 
-            # Compute cosine similarity
-            sim_matrix = F.cosine_similarity(averaged_embeddings.unsqueeze(1), averaged_embeddings.unsqueeze(0), dim=-1)
+            labels = test_label.view(-1)  # shape: (N,)
+            num_samples = labels.size(0)
 
-            # Create a mask for similar pairs
-            mask = label.unsqueeze(1) == label.unsqueeze(0)
+            # ----- Top-1 Accuracy -----
+            top1_indices = torch.argmax(sim_matrix, dim=1)
+            top1_labels = labels[top1_indices]
+            correct_top1 = (top1_labels == labels).float().sum().item()
+            top1_accuracy = correct_top1 / num_samples * 100.0
 
-            # Calculate predicted similarities based on a threshold
-            threshold = 0.5  # Adjust this threshold as needed
-            predicted_similar = (sim_matrix > threshold).float()
+            # ----- Top-5 Accuracy -----
+            top5_indices = torch.topk(sim_matrix, k=5, dim=1).indices  # shape: (N,5)
+            # For each sample, check if any of the top-5 predictions has the same label as the anchor
+            top5_correct = 0
+            for i in range(num_samples):
+                if (labels[i] == labels[top5_indices[i]]).any():
+                    top5_correct += 1
+            top5_accuracy = top5_correct / num_samples * 100.0
 
-            # Count true positives and true negatives
-            true_positives = (predicted_similar * mask.float()).sum()
-            true_negatives = ((1 - predicted_similar) * (1 - mask.float())).sum()
+            # ----- Mean Positive and Negative Similarities -----
+            # Create a boolean mask where True = same label (positive pair) and exclude self
+            mask_pos = (labels.unsqueeze(1) == labels.unsqueeze(0))
+            mask_self = torch.eye(num_samples, dtype=torch.bool, device=labels.device)
+            mask_pos = mask_pos & ~mask_self
 
-            # Update total counts for accuracy calculation
-            total_correct += true_positives + true_negatives
-            total_samples += mask.numel()
+            # Mean similarity for positives and negatives
+            mean_positive_sim = sim_matrix[mask_pos].mean().item() if mask_pos.sum() > 0 else float('nan')
+            mean_negative_sim = sim_matrix[~mask_pos].mean().item() if (~mask_pos).sum() > 0 else float('nan')
+            margin = mean_positive_sim - mean_negative_sim
+
+        # Log to wandb
+        wandb.log({
+            "val_top1_acc": top1_accuracy,
+            "val_top5_acc": top5_accuracy,
+            "mean_positive_sim": mean_positive_sim,
+            "mean_negative_sim": mean_negative_sim,
+            "sim_margin": margin
+        })
 
         # Calculate overall accuracy
         if total_samples > 0:
-            acc = total_correct / total_samples * 100.
+            acc = top1_accuracy
         else:
             acc = 0.0  # Handle edge case where there are no samples
 
