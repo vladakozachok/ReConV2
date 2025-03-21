@@ -462,71 +462,136 @@ class PointTransformer(nn.Module):
         self.cd_loss = ChamferDistance()
         self.apply(self._init_weights)
 
-    def get_loss_acc(self, embeddings, labels, names, temperature=1):
-        # Normalise embeddings
+
+    def get_loss_acc(self, embeddings, labels, names, temperature=0.07, symmetrical=True):
+        """
+        Minimal InfoNCE loss using only the first valid (anchor, positive) pair.
+        
+        • Normalise embeddings.
+        • Compute cosine similarity matrix scaled by temperature.
+        • Identify the first valid (anchor, positive) pair (label occurs exactly twice).
+        • For anchor i → positive j:
+            L(i→j) = - [ sim(i,j)/T - logsumexp_{k≠i}( sim(i,k)/T ) ]
+            (Exclude self from the denominator.)
+        • Optionally compute symmetric loss (j→i) and average.
+        • Also compute ranking metrics:
+            - Top-1: if the positive is highest scoring.
+            - Top-5: if the positive is among the top 5.
+            - Top-9: if the positive is among the top 9.
+        • Loss remains a tensor for backprop.
+        """
+        # 1. Normalise embeddings
         embeddings = F.normalize(embeddings, dim=-1, eps=1e-6)
         if torch.isnan(embeddings).any():
-            print("Labels for Nan")
-            print(labels)
+            print("NaNs in embeddings; labels:", labels)
             return None, None
 
-        sim_matrix = F.cosine_similarity(embeddings.unsqueeze(1), embeddings.unsqueeze(0), dim=-1) / temperature
-        batch_size = len(embeddings)
-        
-        # Find a valid anchor-positive pair: assumes exactly 2 samples share the same label
-        anchor_idx = 0
-        positive_idx = None
-        while positive_idx is None and anchor_idx < batch_size:
-            anchor_label = labels[anchor_idx]
-            positive_indices = torch.where(labels == anchor_label)[0]
-            if len(positive_indices) == 2:
-                # Select the positive sample (not the anchor)
-                positive_idx = positive_indices[positive_indices != anchor_idx][0].item()
+        # 2. Compute cosine similarity matrix and scale by temperature
+        sim_matrix = F.cosine_similarity(
+            embeddings.unsqueeze(1),
+            embeddings.unsqueeze(0),
+            dim=-1
+        )  # shape: (batch_size, batch_size)
+        scaled_sim_matrix = sim_matrix / temperature
+        batch_size = embeddings.size(0)
+
+        # 3. Identify the first valid (anchor, positive) pair (label occurs exactly twice)
+        valid_pair = None
+        for label in torch.unique(labels):
+            idx = torch.where(labels == label)[0]
+            if idx.numel() == 2:
+                valid_pair = (idx[0].item(), idx[1].item())
+                break
+        if valid_pair is None:
+            print("No valid anchor-positive pairs found.")
+            return None, None
+        i, j = valid_pair
+
+        # 4. Compute InfoNCE loss for i→j
+        pos_score_i = scaled_sim_matrix[i, j]  # positive similarity score for anchor i
+        mask_i = torch.ones(batch_size, dtype=torch.bool, device=embeddings.device)
+        mask_i[i] = False                     # remove self from denominator
+        denom_i = torch.logsumexp(scaled_sim_matrix[i][mask_i], dim=0)
+        loss_i = -(pos_score_i - denom_i)       # loss for i→j (remains a tensor)
+
+        # 5. Ranking metrics for anchor i:
+        # Adjust target index: if j > i then the index in the masked array becomes j-1; else it's j.
+        target_i_idx = j - 1 if j > i else j
+        # Top-1: Check if the highest score corresponds to the positive.
+        _, sorted_i = torch.sort(scaled_sim_matrix[i][mask_i], descending=True)
+        top1_hit_i = 100.0 if sorted_i[0].item() == target_i_idx else 0.0
+        # Top-5 and Top-9: Check if positive is among the top 5/9.
+        top5_i_vals, top5_i_idxs = torch.topk(scaled_sim_matrix[i][mask_i], k=5)
+        top5_hit_i = 100.0 if (top5_i_idxs == target_i_idx).any().item() else 0.0
+        top9_i_vals, top9_i_idxs = torch.topk(scaled_sim_matrix[i][mask_i], k=9)
+        top9_hit_i = 100.0 if (top9_i_idxs == target_i_idx).any().item() else 0.0
+
+        # 6. Optionally compute symmetric loss for j→i
+        if symmetrical:
+            pos_score_j = scaled_sim_matrix[j, i]
+            mask_j = torch.ones(batch_size, dtype=torch.bool, device=embeddings.device)
+            mask_j[j] = False                    # remove self from denominator
+            denom_j = torch.logsumexp(scaled_sim_matrix[j][mask_j], dim=0)
+            loss_j = -(pos_score_j - denom_j)
+            loss = 0.5 * (loss_i + loss_j)         # combined loss remains a tensor
+
+            target_j_idx = i - 1 if i > j else i
+            _, sorted_j = torch.sort(scaled_sim_matrix[j][mask_j], descending=True)
+            top1_hit_j = 100.0 if sorted_j[0].item() == target_j_idx else 0.0
+            top5_j_vals, top5_j_idxs = torch.topk(scaled_sim_matrix[j][mask_j], k=5)
+            top5_hit_j = 100.0 if (top5_j_idxs == target_j_idx).any().item() else 0.0
+            top9_j_vals, top9_j_idxs = torch.topk(scaled_sim_matrix[j][mask_j], k=9)
+            top9_hit_j = 100.0 if (top9_j_idxs == target_j_idx).any().item() else 0.0
+
+            avg_top1_hit = (top1_hit_i + top1_hit_j) / 2.0
+            avg_top5_hit = (top5_hit_i + top5_hit_j) / 2.0
+            avg_top9_hit = (top9_hit_i + top9_hit_j) / 2.0
+
+            # Top-1 accuracy: if positive has the highest score.
+            neg_scores_i = scaled_sim_matrix[i][mask_i]
+            acc_i = 100.0 if pos_score_i > neg_scores_i.max() else 0.0
+            neg_scores_j = scaled_sim_matrix[j][mask_j]
+            acc_j = 100.0 if pos_score_j > neg_scores_j.max() else 0.0
+            avg_acc = (acc_i + acc_j) / 2.0
+        else:
+            loss = loss_i
+            avg_top1_hit = top1_hit_i
+            avg_top5_hit = top5_hit_i
+            avg_top9_hit = top9_hit_i
+            neg_scores_i = scaled_sim_matrix[i][mask_i]
+            avg_acc = 100.0 if pos_score_i > neg_scores_i.max() else 0.0
+
+        # 7. (Optional) Additional similarity metrics
+        avg_pos_sim = (sim_matrix[i, j].item() + sim_matrix[j, i].item()) / 2.0 if symmetrical else sim_matrix[i, j].item()
+        neg_mask_i = mask_i.clone()
+        neg_mask_i[j] = False  # remove positive as well
+        neg_mask_j = mask_j.clone() if symmetrical else None
+        if neg_mask_j is not None:
+            neg_mask_j[i] = False
+        mean_neg_sim = 0.0
+        if neg_mask_i.any():
+            neg_mean_i = sim_matrix[i][neg_mask_i].mean().item()
+            if symmetrical and neg_mask_j.any():
+                neg_mean_j = sim_matrix[j][neg_mask_j].mean().item()
+                mean_neg_sim = (neg_mean_i + neg_mean_j) / 2.0
             else:
-                anchor_idx += 1
-        
-        if positive_idx is None:
-            print("No valid anchor-positive pair found.")
-            return None, None
+                mean_neg_sim = neg_mean_i
 
-        # Extract logits for the selected anchor (row of similarity matrix)
-        logits = sim_matrix[anchor_idx].unsqueeze(0)  # Shape: (1, batch_size)
-        # Create target for cross_entropy: the index of the positive sample
-        target = torch.tensor([positive_idx], device=embeddings.device)
-
-        # Compute cross-entropy loss
-        # loss = F.cross_entropy(logits, target)
-
-        loss = -torch.log(torch.exp(logits[0, positive_idx] / temperature) / torch.exp(logits).sum())
-
-        # Exclude anchor itself for ranking/accuracy: remove the anchor's score
-        logits_without_anchor = torch.cat([logits[0, :anchor_idx], logits[0, anchor_idx+1:]])
-        # Adjust positive index since anchor has been removed from logits
-        adjusted_positive_idx = positive_idx - 1 if positive_idx > anchor_idx else positive_idx
-
-        # Determine rank of the positive example
-        sorted_logits, sorted_indices = torch.sort(logits_without_anchor, descending=True)
-        # Rank: position of adjusted_positive_idx in sorted_indices (1-indexed)
-        pos_rank = (sorted_indices == adjusted_positive_idx).nonzero(as_tuple=True)[0].item() + 1
-
-        # Calculate accuracy: if top-1 prediction is the positive sample
-        acc = 100.0 if pos_rank == 1 else 0.0
-
-        # Additional similarity metrics
-        positive_sim = sim_matrix[anchor_idx, positive_idx].item()
-        negative_sim = (sim_matrix[anchor_idx].sum() - sim_matrix[anchor_idx, anchor_idx] - positive_sim) / (batch_size - 2)
-        negative_sim = negative_sim.item()
-
-        # Log metrics to wandb
-        wandb.log({
+        # 8. Log metrics via wandb (loss.item() used only for logging)
+        log_dict = {
             "loss": loss.item(),
-            "accuracy": acc,
-            "positive_similarity": positive_sim,
-            "mean_negative_similarity": negative_sim,
-            "positive_rank": pos_rank  # New metric: rank of the positive example
-        })
+            "accuracy": avg_acc,
+            "positive_similarity": avg_pos_sim,
+            "mean_negative_similarity": mean_neg_sim,
+            "num_valid_pairs": 1,
+            "top1_hit": avg_top1_hit,
+            "top5_hit": avg_top5_hit,
+            "top9_hit": avg_top9_hit,
+        }
+        wandb.log(log_dict)
 
-        return loss, acc
+        return loss, avg_acc
+
 
     def load_model_from_ckpt(self, ckpt_path, log=True):
         if ckpt_path is not None:

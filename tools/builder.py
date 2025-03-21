@@ -207,7 +207,7 @@ import torch
 from torch.utils.data import DataLoader, Sampler
 
 class SimilarPairBatchSampler(Sampler):
-    def __init__(self, dataset, batch_size=10):
+    def __init__(self, dataset, batch_size=10, seed =42):
         """
         Args:
             dataset: Your dataset instance. It must have an attribute `datapath` which is a list of tuples,
@@ -218,6 +218,7 @@ class SimilarPairBatchSampler(Sampler):
         self.dataset = dataset
         self.batch_size = batch_size
         self.num_samples = len(dataset)
+        self.seed = seed
         
         # Build a mapping from asset id to a list of indices.
         self.asset_to_indices = {}
@@ -225,6 +226,8 @@ class SimilarPairBatchSampler(Sampler):
             self.asset_to_indices.setdefault(asset, []).append(idx)
     
     def __iter__(self):
+        
+        r = random.Random(self.seed)
         # Create a local copy (per epoch) of the available indices per asset.
         available = {asset: indices.copy() for asset, indices in self.asset_to_indices.items()}
         
@@ -238,7 +241,7 @@ class SimilarPairBatchSampler(Sampler):
                 break
             
             # Randomly select 5 distinct assets.
-            chosen_assets = random.sample(candidate_assets, 5)
+            chosen_assets = r.sample(candidate_assets, 5)
             batch = []
             # For each asset, randomly sample 2 indices.
             for asset in chosen_assets:

@@ -252,7 +252,7 @@ def run_net(args, config):
             
 
 def validate(base_model, test_dataloader, epoch, args, config, best_metrics, logger=None):
-    print_log(f"[VALIDATION] Start validating epoch {epoch}", logger = logger)
+    print_log(f"[VALIDATION] Start validating epoch {epoch}", logger=logger)
     base_model.eval()  # set model to eval mode
 
     test_pred = []
@@ -267,12 +267,11 @@ def validate(base_model, test_dataloader, epoch, args, config, best_metrics, log
             name = data[2]
 
             points = misc.fps(points, npoints)
-            embeddings, _ = base_model(points)
+            embeddings, _= base_model(points)
 
             test_pred.append(embeddings)
             test_label.append(label)
             test_name.extend(name)
-        
 
         test_pred = torch.cat(test_pred, dim=0)
         test_label = torch.cat(test_label, dim=0)
@@ -282,31 +281,47 @@ def validate(base_model, test_dataloader, epoch, args, config, best_metrics, log
             test_label = dist_utils.gather_tensor(test_label, args)
 
         test_pred = F.normalize(test_pred, p=2, dim=1)
-        sim_matrix = F.cosine_similarity(test_pred.unsqueeze(1), test_pred.unsqueeze(0), dim=-1) 
-        sim_matrix.fill_diagonal_(-float('inf'))
+        sim_matrix = F.cosine_similarity(test_pred.unsqueeze(1), test_pred.unsqueeze(0), dim=-1)
+        sim_matrix.fill_diagonal_(-float('inf'))  # avoid self-match
+
+        # Top-1 accuracy
         top1_indices = torch.argmax(sim_matrix, dim=1)
-        
         labels = test_label.view(-1)  # Flatten labels to shape (N,)
         num_samples = labels.size(0)
-
-        top1_labels = labels[top1_indices]
+        top1_labels = labels[top1_indices.view(-1)]
         correct_top1 = (top1_labels == labels).float().sum().item()
         top1_accuracy = correct_top1 / num_samples * 100.0
 
-        acc = top1_accuracy
+        # Top-5 accuracy
+        _, top5_indices = torch.topk(sim_matrix, k=5, dim=1)
+        top5_labels = labels[top5_indices.view(-1)].view(top5_indices.shape)
+        correct_top5 = ((top5_labels == labels[:, None]).any(dim=1)).float().sum().item()
+        top5_accuracy = correct_top5 / num_samples * 100.0
 
+        # Top-10 accuracy
+        _, top10_indices = torch.topk(sim_matrix, k=10, dim=1)
+        top10_labels = labels[top10_indices.view(-1)].view(top10_indices.shape)
+        correct_top10 = ((top10_labels == labels[:, None]).any(dim=1)).float().sum().item()
+        top10_accuracy = correct_top10 / num_samples * 100.0
 
-        print_log('[Validation Similarity] EPOCH: %d  accuracy = %.4f' % (epoch, acc), logger=logger)
+        print_log(
+            '[Validation Similarity] EPOCH: %d  top1_acc = %.4f, top5_acc = %.4f, top10_acc = %.4f' %
+            (epoch, top1_accuracy, top5_accuracy, top10_accuracy),
+            logger=logger
+        )
 
         wandb.log({
-                "val_top1_acc": acc,
-            })
+            "val_top1_acc": top1_accuracy,
+            "val_top5_acc": top5_accuracy,
+            "val_top10_acc": top10_accuracy,
+        })
 
         if args.distributed:
             torch.cuda.synchronize()
-        
+
         del sim_matrix
-    return Acc_Metric(acc)
+    return Acc_Metric(top1_accuracy)
+
 
 
 def validate_vote(base_model, test_dataloader, epoch, args, config, logger=None, times=10):
@@ -376,6 +391,15 @@ def validate_vote(base_model, test_dataloader, epoch, args, config, logger=None,
                     top5_correct += 1
             top5_accuracy = top5_correct / num_samples * 100.0
 
+            # ----- Top-9 Accuracy -----
+            top9_indices = torch.topk(sim_matrix, k=9, dim=1).indices  # shape: (N,5)
+            # For each sample, check if any of the top-5 predictions has the same label as the anchor
+            top5_correct = 0
+            for i in range(num_samples):
+                if (labels[i] == labels[top9_indices[i]]).any():
+                    top9_correct += 1
+            top9_accuracy = top9_correct / num_samples * 100.0
+
             # ----- Mean Positive and Negative Similarities -----
             # Create a boolean mask where True = same label (positive pair) and exclude self
             mask_pos = (labels.unsqueeze(1) == labels.unsqueeze(0))
@@ -391,6 +415,7 @@ def validate_vote(base_model, test_dataloader, epoch, args, config, logger=None,
         wandb.log({
             "val_top1_acc": top1_accuracy,
             "val_top5_acc": top5_accuracy,
+            "val_top9_acc": top9_accuracy,
             "mean_positive_sim": mean_positive_sim,
             "mean_negative_sim": mean_negative_sim,
             "sim_margin": margin
