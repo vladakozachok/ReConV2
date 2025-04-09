@@ -206,62 +206,101 @@ import random
 import torch
 from torch.utils.data import DataLoader, Sampler
 
+import random
+from torch.utils.data import Sampler
+
 class SimilarPairBatchSampler(Sampler):
-    def __init__(self, dataset, batch_size=10, seed =42):
+    def __init__(self, dataset, batch_size=10, seed=42):
         """
         Args:
             dataset: Your dataset instance. It must have an attribute `datapath` which is a list of tuples,
-                     where the first element is the asset identifier.
+                     where the first element is the asset identifier (asset path).
             batch_size: Number of samples per batch (should be 10 in this case).
         """
-        # assert batch_size == 10, "This sampler is designed for batch_size of 10."
         self.dataset = dataset
         self.batch_size = batch_size
         self.num_samples = len(dataset)
         self.seed = seed
         
-        # Build a mapping from asset id to a list of indices.
-        self.asset_to_indices = {}
-        for idx, (asset, _) in enumerate(dataset.datapath):
-            self.asset_to_indices.setdefault(asset, []).append(idx)
-    
-    def __iter__(self):
+        # Initialize mappings for label to indices, contract, and label
+        self.label_to_indices = {}
+        self.asset_to_contract = {}
+        self.asset_to_label = {}
         
+        # Assuming dataset.datapath contains the full asset path
+        for idx, asset_path in enumerate(dataset.datapath):
+            contract, label = self.extract_contract_and_label(asset_path)
+            
+            # Group samples by label instead of asset_path
+            if label not in self.label_to_indices:
+                self.label_to_indices[label] = []
+            self.label_to_indices[label].append(idx)
+            
+            # Store the contract and label associated with this asset
+            self.asset_to_contract[idx] = contract
+            self.asset_to_label[idx] = label
+
+    def extract_contract_and_label(self, asset_path):
+        """
+        Given an asset path, extract the contract and label.
+        """
+        # Example: Extracting the label from the asset path (customize based on your path structure)
+        parts = asset_path[0].split('-')
+        
+        # The contract is the first part of the asset path
+        contract = parts[0]
+        
+        # The label is the last part before ".pt" (adjust as needed)
+        label = asset_path[0]  # assuming label is second-to-last part in the path
+        
+        return contract, label
+
+    def __iter__(self):
         r = random.Random(self.seed)
-        # Create a local copy (per epoch) of the available indices per asset.
-        available = {asset: indices.copy() for asset, indices in self.asset_to_indices.items()}
+        
+        # Create a local copy (per epoch) of the available indices per label.
+        available = {label: indices.copy() for label, indices in self.label_to_indices.items()}
         
         batches = []
+        
         # Continue until we can no longer form a full batch.
         while True:
-            # Build a list of candidate assets that have at least 2 samples remaining.
-            candidate_assets = [asset for asset, inds in available.items() if len(inds) >= 2]
-            if len(candidate_assets) < 5:
-                # Not enough assets to form 5 distinct pairs.
+            # Build a list of candidate labels that have at least 2 samples remaining.
+            candidate_labels = [label for label, inds in available.items() if len(inds) >= 2]
+
+            if len(candidate_labels) < 5:
+                print("Not enough labels to form a full batch")
                 break
             
-            # Randomly select 5 distinct assets.
-            chosen_assets = r.sample(candidate_assets, 5)
+            # Randomly select 5 distinct labels
+            chosen_labels = r.sample(candidate_labels, 5)
+            
             batch = []
-            # For each asset, randomly sample 2 indices.
-            for asset in chosen_assets:
-                inds = available[asset]
+            # For each selected label, randomly sample 2 indices.
+            for label in chosen_labels:
+                inds = available[label]
+                
+                # Randomly select 2 indices for the current label
                 pair = random.sample(inds, 2)
                 batch.extend(pair)
-                # Remove the chosen indices from the available pool.
+                
+                # Remove the selected indices from the available pool
                 for i in pair:
-                    available[asset].remove(i)
-            # Shuffle the batch order.
+                    available[label].remove(i)
+
+            # Shuffle the batch order (optional)
             random.shuffle(batch)
             batches.append(batch)
-        
+    
         # Yield each batch.
         for batch in batches:
             yield batch
 
     def __len__(self):
-        # Estimate the number of full batches by summing pairs available across assets
-        total_pairs = sum(len(inds) // 2 for inds in self.asset_to_indices.values())
+        # Estimate the number of full batches by summing pairs available across labels
+        total_pairs = sum(len(inds) // 2 for inds in self.label_to_indices.values())
+        
         # Each batch requires 5 distinct pairs.
         return total_pairs // 5
+
 

@@ -447,23 +447,22 @@ class PointTransformer(nn.Module):
 
         feature_dim = 768
         self.embedding_head = nn.Sequential(
-            nn.Linear(feature_dim, 256),
-            nn.LayerNorm(256),
+           nn.Linear(feature_dim, 256),
+            nn.BatchNorm1d(256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.5),
-            nn.Linear(256, 128),
-            nn.LayerNorm(128),
+            nn.Linear(256, 256),
+            nn.BatchNorm1d(256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.5),
-            nn.Linear(128,64),              # Final embedding layer output size
-            nn.LayerNorm(64)
+            nn.Linear(256, 128)
         )
         #chamfer distance loss
         self.cd_loss = ChamferDistance()
         self.apply(self._init_weights)
 
 
-    def get_loss_acc(self, embeddings, labels, names, temperature=0.07, symmetrical=True):
+    def get_loss_acc(self, embeddings, labels, names, temperature=0.06, symmetrical=False):
         """
         Minimal InfoNCE loss using only the first valid (anchor, positive) pair.
         
@@ -510,10 +509,10 @@ class PointTransformer(nn.Module):
         # 4. Compute InfoNCE loss for i→j
         pos_score_i = scaled_sim_matrix[i, j]  # positive similarity score for anchor i
         mask_i = torch.ones(batch_size, dtype=torch.bool, device=embeddings.device)
-        mask_i[i] = False                     # remove self from denominator
+        mask_i[i] = False  
+            # remove self from denominator
         denom_i = torch.logsumexp(scaled_sim_matrix[i][mask_i], dim=0)
         loss_i = -(pos_score_i - denom_i)       # loss for i→j (remains a tensor)
-
         # 5. Ranking metrics for anchor i:
         # Adjust target index: if j > i then the index in the masked array becomes j-1; else it's j.
         target_i_idx = j - 1 if j > i else j
@@ -530,7 +529,8 @@ class PointTransformer(nn.Module):
         if symmetrical:
             pos_score_j = scaled_sim_matrix[j, i]
             mask_j = torch.ones(batch_size, dtype=torch.bool, device=embeddings.device)
-            mask_j[j] = False                    # remove self from denominator
+            mask_j[j] = False   
+            mask_j[i] = False                  # remove self from denominator
             denom_j = torch.logsumexp(scaled_sim_matrix[j][mask_j], dim=0)
             loss_j = -(pos_score_j - denom_j)
             loss = 0.5 * (loss_i + loss_j)         # combined loss remains a tensor
@@ -548,23 +548,23 @@ class PointTransformer(nn.Module):
             avg_top9_hit = (top9_hit_i + top9_hit_j) / 2.0
 
             # Top-1 accuracy: if positive has the highest score.
-            neg_scores_i = scaled_sim_matrix[i][mask_i]
+            neg_scores_i = scaled_sim_matrix[i][mask_denom]
             acc_i = 100.0 if pos_score_i > neg_scores_i.max() else 0.0
             neg_scores_j = scaled_sim_matrix[j][mask_j]
             acc_j = 100.0 if pos_score_j > neg_scores_j.max() else 0.0
             avg_acc = (acc_i + acc_j) / 2.0
         else:
+            neg_mask_i = mask_i.clone()
+            neg_mask_i[j] = False  # remove positive as well
             loss = loss_i
             avg_top1_hit = top1_hit_i
             avg_top5_hit = top5_hit_i
             avg_top9_hit = top9_hit_i
-            neg_scores_i = scaled_sim_matrix[i][mask_i]
+            neg_scores_i = scaled_sim_matrix[i][neg_mask_i]
             avg_acc = 100.0 if pos_score_i > neg_scores_i.max() else 0.0
 
         # 7. (Optional) Additional similarity metrics
         avg_pos_sim = (sim_matrix[i, j].item() + sim_matrix[j, i].item()) / 2.0 if symmetrical else sim_matrix[i, j].item()
-        neg_mask_i = mask_i.clone()
-        neg_mask_i[j] = False  # remove positive as well
         neg_mask_j = mask_j.clone() if symmetrical else None
         if neg_mask_j is not None:
             neg_mask_j[i] = False
@@ -688,5 +688,5 @@ class PointTransformer(nn.Module):
 
         point_cloud_embedding = torch.mean(encoded_features, dim=1)
         ret = self.embedding_head(point_cloud_embedding)
-        ret = F.normalize(ret, p=2, dim=1) 
+        ret = F.normalize(ret, p=2, dim=-1) 
         return ret, cd_l1_loss + cd_l2_loss

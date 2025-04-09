@@ -34,7 +34,7 @@ class YakoaDataset(Dataset):
         collection_ids = {}
 
         assert self.subset in ['train', 'test']
-        collection_ids['train'] = self.read_text_file('train.txt')
+        collection_ids['train'] = self.read_text_file('train_full_updated.txt')
         collection_ids['test'] = self.read_text_file('validation.txt')
 
         

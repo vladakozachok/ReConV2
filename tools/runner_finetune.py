@@ -36,10 +36,7 @@ class Acc_Metric:
     def state_dict(self):
         _dict = dict()
         _dict['acc'] = self.acc
-        return _dict
-
-
-def run_net(args, config):
+        return _dictdef run_net(args, config):
     logger = get_logger(args.log_name)
     # build dataset
     config.dataset.train.others.with_color = config.model.with_color
@@ -54,6 +51,9 @@ def run_net(args, config):
             data_transforms.PointcloudScaleAndTranslate(),
         ])
     else:
+
+
+
         train_transforms = transforms.Compose([
             data_transforms.PointcloudRotate(),
         ])
@@ -177,9 +177,8 @@ def run_net(args, config):
                 torch.cuda.empty_cache()
                 continue 
             
-            _loss = loss  + 3 * cd_loss
+            _loss = loss  #+ 3 * cd_loss
             _loss.backward()
-
 
             # forward
             if num_iter == config.step_per_update:
@@ -277,6 +276,7 @@ def validate(base_model, test_dataloader, epoch, args, config, best_metrics, log
         test_label = torch.cat(test_label, dim=0)
 
         if args.distributed:
+            print("yes")
             test_pred = dist_utils.gather_tensor(test_pred, args)
             test_label = dist_utils.gather_tensor(test_label, args)
 
